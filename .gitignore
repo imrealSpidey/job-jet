@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+ui/node_modules/
+
+# Build output
+dist/
+ui/dist/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Persistent browser profile (contains session cookies & credentials)
+browser_profile/
+
+# Runtime data & Personal information (resumes, exports, profiles, job caches, screenshots)
+data/*
+!data/source/
+data/source/*
+!data/source/.gitkeep
+!data/screenshots/
+data/screenshots/*
+!data/screenshots/.gitkeep
+output/*
+!output/.gitkeep
+
+# Temporary / Scratch test scripts
+*.log
+scratch/
+test_*
+temp*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

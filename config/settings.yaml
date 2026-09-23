@@ -1,0 +1,31 @@
+ingestion:
+  mode: api
+  apify_actor_id: BHzefUZlZRKWxkTck
+  apify_input:
+    rows: 10
+    publishedAt: r604800
+    easyApply: true
+    enrichCompany: false
+    enrichCompanyWebsite: false
+    workTypes: []
+ai:
+  provider: gemini
+  model: gemini-3.6-flash
+  max_approved_jobs: 15
+evaluation_weights:
+  core_technical_stack: 40
+  seniority_alignment: 30
+  domain_relevance: 20
+  bonus_skills: 10
+  match_threshold: 80
+safety:
+  job_cooldown_min_s: 45
+  job_cooldown_max_s: 120
+  typing_speed_min_ms: 40
+  typing_speed_max_ms: 90
+  click_jitter_base_ms: 2500
+  click_jitter_variance_ms: 1200
+browser:
+  user_data_dir: ./browser_profile
+  headless: false
+  slow_mo: 0
