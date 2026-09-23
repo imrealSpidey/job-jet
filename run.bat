@@ -14,10 +14,31 @@ REM 1. Verify Node.js is installed
 where node >nul 2>nul
 if %ERRORLEVEL% equ 0 goto :node_ok
 
-color 0C
-echo   [ERROR] Node.js is not installed on this computer!
+color 0E
+echo   [SETUP] Node.js is not installed on this computer.
+echo   [SETUP] Downloading and installing Node.js automatically...
+echo   Please wait, this may take a few minutes. (A UAC prompt might appear)
 echo.
-echo   Please download and install Node.js (version 20 or higher) from:
+
+REM Download and install Node.js using winget
+winget install OpenJS.NodeJS -e --source winget --accept-package-agreements --accept-source-agreements --silent
+
+REM Winget might not immediately update the current session PATH
+REM We manually add the standard install paths to the current session's PATH
+set "PATH=%PATH%;C:\Program Files\nodejs;%APPDATA%\npm"
+
+where node >nul 2>nul
+if %ERRORLEVEL% equ 0 (
+    color 0A
+    echo   [SUCCESS] Node.js installed successfully!
+    echo.
+    goto :node_ok
+)
+
+color 0C
+echo   [ERROR] Failed to install Node.js automatically.
+echo.
+echo   Please download and install Node.js (version 20 or higher) manually from:
 echo   https://nodejs.org
 echo.
 echo   After installing Node.js, restart your computer and run this file again.
