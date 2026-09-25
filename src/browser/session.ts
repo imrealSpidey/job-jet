@@ -301,6 +301,15 @@ export async function closeBrowser(session: BrowserSession): Promise<void> {
  * Keeps all prefilled application tabs alive on screen for user review and submission.
  */
 export async function disconnectBrowser(session: BrowserSession): Promise<void> {
-  // Do not close context or pages. Leaving them alive for user submission.
-  console.log(chalk.gray(`\n🌐 [BROWSER] Leaving pre-filled tabs open for human review and submission.`));
+  try {
+    // If connected via CDP, call disconnect() on the Browser object to release the Node process
+    // while keeping the Chrome window and all tabs alive on the user's desktop.
+    const browser = session.context.browser();
+    if (browser && browser.isConnected()) {
+      (browser as any).disconnect?.();
+    }
+    console.log(chalk.gray(`\n🌐 [BROWSER] Leaving pre-filled tabs open for human review and submission.`));
+  } catch {
+    // Ignore errors during cleanup
+  }
 }

@@ -13,9 +13,9 @@ import chalk from "chalk";
 import { confirm } from "@inquirer/prompts";
 import type { BrowserContext } from "playwright";
 import type { ScoredJob, Settings } from "./types.js";
-import { paths, appendHistory, getApiKeys } from "./config.js";
+import { paths, appendHistory } from "./config.js";
 import { launchBrowser, closeBrowser } from "./browser/session.js";
-import { generateTextResponse, type AiConfig } from "./ai.js";
+import { generateTextResponse, getModelForTask, type AiConfig } from "./ai.js";
 
 // ============================================================
 // Cover Note Generation
@@ -33,7 +33,9 @@ async function generateCoverNote(
   aiConfig: AiConfig,
   apiKeys: string[],
   job: ScoredJob,
-  resumeText: string
+  resumeText: string,
+  fallbackConfig?: AiConfig,
+  fallbackApiKeys?: string[]
 ): Promise<string> {
   const userPrompt = `
 ## Job Title: ${job.title}
@@ -50,7 +52,14 @@ Generate the 150-word cover note now.
 `;
 
   try {
-    const text = await generateTextResponse(aiConfig, apiKeys, COVER_NOTE_SYSTEM_PROMPT, userPrompt);
+    const text = await generateTextResponse(
+      aiConfig,
+      apiKeys,
+      COVER_NOTE_SYSTEM_PROMPT,
+      userPrompt,
+      fallbackConfig,
+      fallbackApiKeys
+    );
     return text.trim() || "Failed to generate cover note.";
   } catch (err) {
     console.warn(
@@ -71,11 +80,7 @@ export async function exportExternalShortlist(
 ): Promise<void> {
   if (externalJobs.length === 0) return;
 
-  const aiConfig: AiConfig = {
-    provider: settings.ai.provider,
-    model: settings.ai.model,
-  };
-  const apiKeys = getApiKeys(aiConfig.provider);
+  const { config: aiConfig, apiKeys, fallbackConfig, fallbackApiKeys } = getModelForTask(settings, "form_filling");
 
   console.log(
     chalk.magenta.bold(`\n📝 [EXTERNAL]`),
@@ -90,7 +95,7 @@ export async function exportExternalShortlist(
       chalk.gray(`  [${i + 1}/${externalJobs.length}] Generating pitch for ${job.company}... `)
     );
 
-    const note = await generateCoverNote(aiConfig, apiKeys, job, resumeText);
+    const note = await generateCoverNote(aiConfig, apiKeys, job, resumeText, fallbackConfig, fallbackApiKeys);
     
     // Add to history so we don't process it again
     appendHistory({

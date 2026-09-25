@@ -2,7 +2,7 @@ ingestion:
   mode: api
   apify_actor_id: BHzefUZlZRKWxkTck
   apify_input:
-    rows: 10
+    rows: 50
     publishedAt: r604800
     easyApply: true
     enrichCompany: false
@@ -10,8 +10,18 @@ ingestion:
     workTypes: []
 ai:
   provider: gemini
-  model: gemini-3.6-flash
+  model: gemini-2.5-flash
   max_approved_jobs: 15
+  models:
+    extraction:
+      provider: gemini
+      model: gemini-2.5-flash
+    scoring:
+      provider: gemini
+      model: gemini-2.5-flash
+    form_filling:
+      provider: gemini
+      model: gemini-2.5-flash
 evaluation_weights:
   core_technical_stack: 40
   seniority_alignment: 30

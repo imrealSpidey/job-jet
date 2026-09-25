@@ -17,8 +17,7 @@
 import chalk from "chalk";
 import { type Settings, type FormAnswer } from "./types.js";
 import { loadCandidateProfile } from "./config.js";
-import { getApiKeys } from "./config.js";
-import { generateStructuredResponse, type AiConfig } from "./ai.js";
+import { generateStructuredResponse, getModelForTask, type AiConfig } from "./ai.js";
 
 // ============================================================
 // Tier 1: Deterministic Fallbacks
@@ -85,7 +84,9 @@ async function resolveTier2(
   apiKeys: string[],
   questionText: string,
   options: string[],
-  resumeText: string
+  resumeText: string,
+  fallbackConfig?: AiConfig,
+  fallbackApiKeys?: string[]
 ): Promise<string | null> {
   const prompt = `
 Question: ${questionText}
@@ -97,7 +98,14 @@ ${resumeText}
 Extract the factual answer. If options are provided, your answer MUST match one of the options exactly.`;
 
   try {
-    const json = await generateStructuredResponse(aiConfig, apiKeys, AI_SOLVER_PROMPT, prompt);
+    const json = await generateStructuredResponse(
+      aiConfig,
+      apiKeys,
+      AI_SOLVER_PROMPT,
+      prompt,
+      fallbackConfig,
+      fallbackApiKeys
+    );
 
     if (json.confidence >= 50 && json.answer !== null && json.answer !== "") {
       return json.answer.toString();
@@ -217,13 +225,17 @@ export async function solveQuestion(
   }
 
   // Tier 2
-  const aiConfig: AiConfig = {
-    provider: settings.ai.provider,
-    model: settings.ai.model,
-  };
-  const apiKeys = getApiKeys(aiConfig.provider);
+  const { config: aiConfig, apiKeys, fallbackConfig, fallbackApiKeys } = getModelForTask(settings, "form_filling");
 
-  const t2Answer = await resolveTier2(aiConfig, apiKeys, questionText, options, resumeText);
+  const t2Answer = await resolveTier2(
+    aiConfig,
+    apiKeys,
+    questionText,
+    options,
+    resumeText,
+    fallbackConfig,
+    fallbackApiKeys
+  );
   if (t2Answer !== null) {
     console.log(chalk.yellow(`    ↳ Tier 2 Match: ${t2Answer}`));
     return {

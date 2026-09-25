@@ -174,6 +174,14 @@ export const CandidateProfileSchema = z.object({
 
 export type CandidateProfile = z.infer<typeof CandidateProfileSchema>;
 
+export const TaskModelSchema = z.object({
+  provider: z.enum(["gemini", "openrouter"]).default("gemini"),
+  model: z.string().default("gemini-2.5-flash"),
+});
+export type TaskModelConfig = z.infer<typeof TaskModelSchema>;
+
+export type AiTaskType = "extraction" | "scoring" | "form_filling";
+
 export const SettingsSchema = z.object({
   ingestion: z.object({
     mode: z.enum(["manual", "api"]).default("manual"),
@@ -182,9 +190,17 @@ export const SettingsSchema = z.object({
   }).default({ mode: "manual" }),
 
   ai: z.object({
+    // Legacy single-model fields (kept for backward compat with old settings.yaml)
     provider: z.enum(["gemini", "openrouter"]).default("gemini"),
-    model: z.string().default("gemini-3.6-flash"),
+    model: z.string().default("gemini-2.5-flash"),
     max_approved_jobs: z.number().int().positive().default(15),
+
+    // Task-specific model overrides (new)
+    models: z.object({
+      extraction: TaskModelSchema.default({ provider: "gemini", model: "gemini-2.5-flash" }),
+      scoring: TaskModelSchema.default({ provider: "gemini", model: "gemini-2.5-flash" }),
+      form_filling: TaskModelSchema.default({ provider: "gemini", model: "gemini-2.5-flash" }),
+    }).default({}),
   }),
 
   evaluation_weights: z.object({

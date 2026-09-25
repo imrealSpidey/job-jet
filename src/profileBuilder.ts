@@ -1,12 +1,12 @@
 import { type CandidateProfile, type Settings } from "./types.js";
-import { getApiKeys } from "./config.js";
-import { generateStructuredResponse } from "./ai.js";
+import { generateStructuredResponse, getModelForTask } from "./ai.js";
 
 export async function extractCandidateProfile(resumeText: string, settings: Settings): Promise<Partial<CandidateProfile>> {
-  const aiConfig = settings.ai;
-  const apiKeys = getApiKeys(aiConfig.provider);
+  const { config: aiConfig, apiKeys, fallbackConfig, fallbackApiKeys } = getModelForTask(settings, "extraction");
   
-  if (apiKeys.length === 0) throw new Error(`No ${aiConfig.provider} API keys available for profile extraction.`);
+  if (apiKeys.length === 0 && (!fallbackApiKeys || fallbackApiKeys.length === 0)) {
+    throw new Error(`No API keys available for profile extraction (${aiConfig.provider}). Please configure keys in Settings.`);
+  }
 
   const systemPrompt = `
 You are an expert technical recruiter and data extractor. 
@@ -37,7 +37,14 @@ The output MUST be a raw JSON object with this exact schema:
 `;
 
   try {
-    const parsed = await generateStructuredResponse(aiConfig, apiKeys, systemPrompt, resumeText);
+    const parsed = await generateStructuredResponse(
+      aiConfig,
+      apiKeys,
+      systemPrompt,
+      resumeText,
+      fallbackConfig,
+      fallbackApiKeys
+    );
     parsed.raw_extracted = true;
     return parsed;
   } catch (error: any) {

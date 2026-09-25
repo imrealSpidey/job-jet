@@ -12,7 +12,7 @@ import type { RawJob, ScoredJob, GeminiScore } from "./types.js";
 import { normalizeRawJobInput } from "./types.js";
 import type { Settings } from "./types.js";
 import { paths, getApiKeys } from "./config.js";
-import { generateStructuredResponse, type AiConfig } from "./ai.js";
+import { generateStructuredResponse, getModelForTask, type AiConfig } from "./ai.js";
 
 // ============================================================
 // System Prompt for Job Scoring
@@ -33,6 +33,11 @@ RULES:
    - If the job description directs applicants to apply on a company website, external career portal (e.g. Workday, Greenhouse, Lever, Taleo, iCIMS, or custom link), or email, classify as 'EXTERNAL'.
    - If the job posting does not mention an external site/link, or specifies applying on LinkedIn directly, classify as 'EASY_APPLY'.
    - If truly uncertain, classify as 'UNKNOWN'.
+6. CRITICAL ROLE & PROFESSION INTEGRITY:
+   - You MUST verify that the primary job profession matches the candidate's profession.
+   - If the candidate is a Designer (UI/UX, Product Designer, Interaction Designer) but the job is an Engineering/Development role (e.g., Frontend Developer, Full Stack Engineer, Software Developer, React Engineer), totalScore MUST be capped at under 40% and marked REJECT. Collaborating with developers does NOT make a designer qualified as a developer.
+   - If the candidate is a Software Developer, do NOT approve Designer, Sales, or HR roles.
+   - If the core job discipline does not match the candidate's primary discipline, totalScore MUST be below 45%.
 
 Respond with a JSON object containing:
 - totalScore: integer 0-100 (calculate this as a weighted average based on the user's provided weights, or just a holistic score if not provided)
@@ -88,7 +93,9 @@ async function scoreJob(
   apiKeys: string[],
   job: RawJob,
   resumeText: string,
-  settings: Settings
+  settings: Settings,
+  fallbackConfig?: AiConfig,
+  fallbackApiKeys?: string[]
 ): Promise<GeminiScore | null> {
   const companyStr = (job as any).companyName || job.company || "Unknown";
   const prompt = `
@@ -107,7 +114,14 @@ Evaluate the match. Apply these weights to the totalScore calculation:
 - Bonus: ${settings.evaluation_weights.bonus_skills}%`;
 
   try {
-    const rawJson = await generateStructuredResponse(aiConfig, apiKeys, SCORING_SYSTEM_PROMPT, prompt);
+    const rawJson = await generateStructuredResponse(
+      aiConfig,
+      apiKeys,
+      SCORING_SYSTEM_PROMPT,
+      prompt,
+      fallbackConfig,
+      fallbackApiKeys
+    );
     const tech = rawJson.subScores?.coreTechnicalStack ?? rawJson.subScores?.techStack ?? 0;
     const sen = rawJson.subScores?.seniorityAlignment ?? rawJson.subScores?.seniority ?? 0;
     const dom = rawJson.subScores?.domainRelevance ?? rawJson.subScores?.domain ?? 0;
@@ -150,11 +164,7 @@ export async function evaluateJobs(
   resumeText: string,
   settings: Settings
 ): Promise<ScoredJob[]> {
-  const aiConfig: AiConfig = {
-    provider: settings.ai.provider,
-    model: settings.ai.model,
-  };
-  const apiKeys = getApiKeys(aiConfig.provider);
+  const { config: aiConfig, apiKeys, fallbackConfig, fallbackApiKeys } = getModelForTask(settings, "scoring");
 
   console.log(
     chalk.white(
@@ -203,7 +213,7 @@ export async function evaluateJobs(
         chalk.gray(`  ${progress} Scoring: ${companyStr.substring(0, 15)} — "${titleStr.substring(0, 30)}"... `)
       );
 
-      const scoreResult = await scoreJob(aiConfig, apiKeys, job, resumeText, settings);
+      const scoreResult = await scoreJob(aiConfig, apiKeys, job, resumeText, settings, fallbackConfig, fallbackApiKeys);
 
       if (!scoreResult) {
         console.log(chalk.red("API ERROR"));

@@ -1344,6 +1344,74 @@ const SettingsTab = () => {
   const updateApify = (field: string, val: any) => setData((p: any) => ({...p, settings: {...p.settings, ingestion: {...p.settings.ingestion, apify_input: {...p.settings.ingestion.apify_input, [field]: val}}}}));
   const updateWeights = (field: string, val: any) => setData((p: any) => ({...p, settings: {...p.settings, evaluation_weights: {...p.settings.evaluation_weights, [field]: Number(val)}}}));
 
+  const updateTaskModel = (task: 'extraction' | 'scoring' | 'form_filling', field: 'provider' | 'model', val: string) => {
+    setData((p: any) => {
+      const existingModels = p.settings.ai?.models || {
+        extraction: { provider: p.settings.ai?.provider || "gemini", model: p.settings.ai?.model || "gemini-2.5-flash" },
+        scoring: { provider: p.settings.ai?.provider || "gemini", model: p.settings.ai?.model || "gemini-2.5-flash" },
+        form_filling: { provider: p.settings.ai?.provider || "gemini", model: p.settings.ai?.model || "gemini-2.5-flash" },
+      };
+      const currentTask = existingModels[task] || { provider: "gemini", model: "gemini-2.5-flash" };
+      let newModel = currentTask.model;
+      if (field === 'provider') {
+        if (val === 'openrouter') {
+          newModel = task === 'extraction' ? 'google/gemini-2.0-flash-exp:free' : 'meta-llama/llama-3.3-70b-instruct:free';
+        } else {
+          newModel = 'gemini-2.5-flash';
+        }
+      } else if (field === 'model') {
+        newModel = val;
+      }
+      return {
+        ...p,
+        settings: {
+          ...p.settings,
+          ai: {
+            ...p.settings.ai,
+            models: {
+              ...existingModels,
+              [task]: {
+                ...currentTask,
+                [field]: val,
+                model: newModel,
+              }
+            }
+          }
+        }
+      };
+    });
+  };
+
+  const applyFreePreset = () => {
+    const hasOpenRouter = Boolean(data.keys?.openrouter && data.keys.openrouter.trim().length > 5);
+    setData((p: any) => ({
+      ...p,
+      settings: {
+        ...p.settings,
+        ai: {
+          ...p.settings.ai,
+          provider: "gemini",
+          model: "gemini-2.5-flash",
+          models: {
+            extraction: {
+              provider: "gemini",
+              model: "gemini-2.5-flash"
+            },
+            scoring: {
+              provider: hasOpenRouter ? "openrouter" : "gemini",
+              model: hasOpenRouter ? "meta-llama/llama-3.3-70b-instruct:free" : "gemini-2.5-flash"
+            },
+            form_filling: {
+              provider: hasOpenRouter ? "openrouter" : "gemini",
+              model: hasOpenRouter ? "meta-llama/llama-3.3-70b-instruct:free" : "gemini-2.5-flash"
+            }
+          }
+        }
+      }
+    }));
+    toast.success(hasOpenRouter ? "Configured optimal free hybrid preset (Gemini + OpenRouter Llama 3.3 70B)!" : "Configured optimal free Gemini preset!");
+  };
+
   const handleArrayToggle = (field: string, value: string, checked: boolean) => {
     const current = data.settings.ingestion.apify_input[field] || [];
     let next;
@@ -1360,74 +1428,237 @@ const SettingsTab = () => {
     (data.settings.evaluation_weights?.domain_relevance || 0) +
     (data.settings.evaluation_weights?.bonus_skills || 0);
 
+  // Helper for rendering each task model configuration
+  const renderTaskModelCard = (
+    taskKey: 'extraction' | 'scoring' | 'form_filling',
+    title: string,
+    description: string,
+    badgeText: string,
+    openRouterOptions: Array<{ value: string; label: string }>,
+    geminiOptions: Array<{ value: string; label: string }>
+  ) => {
+    const currentModelConfig = data.settings?.ai?.models?.[taskKey] || {
+      provider: data.settings?.ai?.provider || "gemini",
+      model: data.settings?.ai?.model || "gemini-2.5-flash",
+    };
+    const provider = currentModelConfig.provider || "gemini";
+    const model = currentModelConfig.model || "";
+    const isCustom = provider === "openrouter" && !openRouterOptions.some(o => o.value === model);
+
+    return (
+      <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-gray-50/50 dark:bg-gray-800/50 space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div>
+            <div className="flex items-center gap-2">
+              <h3 className="font-semibold text-sm text-gray-900 dark:text-gray-100">{title}</h3>
+              <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300">
+                {badgeText}
+              </span>
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{description}</p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+          <div>
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Provider</label>
+            <select
+              value={provider}
+              onChange={e => updateTaskModel(taskKey, 'provider', e.target.value)}
+              className={inputCls}
+            >
+              <option value="gemini">Google Gemini (Direct API)</option>
+              <option value="openrouter">OpenRouter (Multi-Provider)</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Model</label>
+            {provider === "openrouter" ? (
+              <div className="space-y-2">
+                <select
+                  value={isCustom ? "__custom__" : model}
+                  onChange={e => {
+                    if (e.target.value !== "__custom__") {
+                      updateTaskModel(taskKey, 'model', e.target.value);
+                    } else {
+                      updateTaskModel(taskKey, 'model', "");
+                    }
+                  }}
+                  className={inputCls}
+                >
+                  {openRouterOptions.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                  <option value="__custom__">Custom model ID...</option>
+                </select>
+                {isCustom && (
+                  <input
+                    type="text"
+                    placeholder="e.g. meta-llama/llama-3.3-70b-instruct:free"
+                    value={model}
+                    onChange={e => updateTaskModel(taskKey, 'model', e.target.value)}
+                    className={inputCls}
+                  />
+                )}
+              </div>
+            ) : (
+              <select
+                value={model || "gemini-2.5-flash"}
+                onChange={e => updateTaskModel(taskKey, 'model', e.target.value)}
+                className={inputCls}
+              >
+                {geminiOptions.map(opt => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col md:flex-row md:items-center justify-between bg-white dark:bg-gray-800 p-6 rounded-lg shadow">
-        <h1 className="text-2xl font-bold">Settings &amp; Configuration</h1>
-        <button onClick={handleSave} className="mt-4 md:mt-0 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700">Save All Changes</button>
+        <div>
+          <h1 className="text-2xl font-bold">Settings &amp; Configuration</h1>
+          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">Configure AI models, API keys, scraper filters, and evaluation criteria.</p>
+        </div>
+        <button onClick={handleSave} className="mt-4 md:mt-0 px-5 py-2.5 bg-blue-600 text-white font-medium rounded-md hover:bg-blue-700 shadow-sm transition">Save All Changes</button>
       </div>
 
       <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow space-y-4">
-        <h2 className="text-lg font-semibold">API Credentials</h2>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <h2 className="text-lg font-semibold">API Credentials</h2>
+          <div className="flex gap-2">
+            <span className={`text-xs px-2.5 py-1 rounded-full font-medium ${data.keys?.gemini ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300'}`}>
+              Gemini: {data.keys?.gemini ? 'Connected' : 'Missing'}
+            </span>
+            <span className={`text-xs px-2.5 py-1 rounded-full font-medium ${data.keys?.openrouter ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300'}`}>
+              OpenRouter: {data.keys?.openrouter ? 'Connected' : 'Optional'}
+            </span>
+          </div>
+        </div>
+
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
-            <label className="block text-sm font-medium mb-1">Gemini API Keys (Comma separated)</label>
-            <input type="password" value={data.keys?.gemini || ""} onChange={e => updateKeys('gemini', e.target.value)} className={inputCls} />
+            <div className="flex justify-between items-center mb-1">
+              <label className="block text-sm font-medium">Gemini API Keys</label>
+              <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-xs text-blue-600 hover:underline">Get Key</a>
+            </div>
+            <input type="password" placeholder="Comma separated for rotation" value={data.keys?.gemini || ""} onChange={e => updateKeys('gemini', e.target.value)} className={inputCls} />
+            <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">Free tier supported. Multiple keys auto-rotate on 429.</p>
           </div>
+
           <div>
-            <label className="block text-sm font-medium mb-1">OpenRouter API Keys</label>
-            <input type="password" value={data.keys?.openrouter || ""} onChange={e => updateKeys('openrouter', e.target.value)} className={inputCls} />
+            <div className="flex justify-between items-center mb-1">
+              <label className="block text-sm font-medium">OpenRouter API Key</label>
+              <a href="https://openrouter.ai/keys" target="_blank" rel="noreferrer" className="text-xs text-blue-600 hover:underline">Get Free Key</a>
+            </div>
+            <input type="password" placeholder="sk-or-v1-..." value={data.keys?.openrouter || ""} onChange={e => updateKeys('openrouter', e.target.value)} className={inputCls} />
+            <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">Unlocks 100+ free open models (Llama 3.3 70B, DeepSeek, Qwen).</p>
           </div>
+
           <div>
-            <label className="block text-sm font-medium mb-1">Apify API Token</label>
-            <input type="password" value={data.keys?.apify || ""} onChange={e => updateKeys('apify', e.target.value)} className={inputCls} />
+            <div className="flex justify-between items-center mb-1">
+              <label className="block text-sm font-medium">Apify API Token</label>
+              <a href="https://console.apify.com/account/integrations" target="_blank" rel="noreferrer" className="text-xs text-blue-600 hover:underline">Get Token</a>
+            </div>
+            <input type="password" placeholder="apify_api_..." value={data.keys?.apify || ""} onChange={e => updateKeys('apify', e.target.value)} className={inputCls} />
+            <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">For scraping LinkedIn jobs via cloud actors.</p>
           </div>
         </div>
       </div>
 
       <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow space-y-4">
-        <h2 className="text-lg font-semibold">AI Engine</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2 border-b border-gray-100 dark:border-gray-700">
           <div>
-            <label className="block text-sm font-medium mb-1">Provider</label>
-            <select value={data.settings?.ai?.provider || "gemini"} onChange={e => updateAi('provider', e.target.value)} className={inputCls}>
-              <option value="gemini">Gemini</option>
-              <option value="openrouter">OpenRouter</option>
-            </select>
+            <h2 className="text-lg font-semibold">AI Engines (Task-Specific Model Selection)</h2>
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+              Each pipeline step is powered by models optimized for that specific task.
+            </p>
           </div>
-          <div>
-            <label className="block text-sm font-medium mb-1">Model</label>
-            {data.settings?.ai?.provider === "openrouter" ? (
-              <>
-                <select value={["google/gemini-2.5-flash-free","meta-llama/llama-3.3-70b-instruct:free","deepseek/deepseek-r1:free","qwen/qwen-2.5-72b-instruct:free","microsoft/phi-3-medium-128k-instruct:free","mistralai/mistral-7b-instruct:free"].includes(data.settings?.ai?.model) ? data.settings.ai.model : "__custom__"} onChange={e => { if (e.target.value !== "__custom__") updateAi('model', e.target.value); else updateAi('model', ''); }} className={inputCls}>
-                  <option value="google/gemini-2.5-flash-free">google/gemini-2.5-flash-free (Recommended)</option>
-                  <option value="meta-llama/llama-3.3-70b-instruct:free">meta-llama/llama-3.3-70b-instruct:free</option>
-                  <option value="deepseek/deepseek-r1:free">deepseek/deepseek-r1:free</option>
-                  <option value="qwen/qwen-2.5-72b-instruct:free">qwen/qwen-2.5-72b-instruct:free</option>
-                  <option value="microsoft/phi-3-medium-128k-instruct:free">microsoft/phi-3-medium-128k-instruct:free</option>
-                  <option value="mistralai/mistral-7b-instruct:free">mistralai/mistral-7b-instruct:free</option>
-                  <option value="__custom__">Custom model ID...</option>
-                </select>
-                {!["google/gemini-2.5-flash-free","meta-llama/llama-3.3-70b-instruct:free","deepseek/deepseek-r1:free","qwen/qwen-2.5-72b-instruct:free","microsoft/phi-3-medium-128k-instruct:free","mistralai/mistral-7b-instruct:free"].includes(data.settings?.ai?.model || "") && (
-                  <input type="text" placeholder="e.g. openai/gpt-4o-mini" value={data.settings?.ai?.model || ""} onChange={e => updateAi('model', e.target.value)} className={inputCls + " mt-2"} />
-                )}
-                <p className="text-xs text-gray-400 mt-1">Browse models at <a href="https://openrouter.ai/models?q=:free" target="_blank" className="text-blue-500 underline">openrouter.ai/models</a></p>
-              </>
-            ) : (
-              <select value={data.settings?.ai?.model || "gemini-3.6-flash"} onChange={e => updateAi('model', e.target.value)} className={inputCls}>
-                <option value="gemini-3.6-flash">gemini-3.6-flash (Fast & Recommended)</option>
-                <option value="gemini-3.7-flash">gemini-3.7-flash</option>
-                <option value="gemini-flash-latest">gemini-flash-latest</option>
-                <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
-              </select>
-            )}
-          </div>
+          <button
+            type="button"
+            onClick={applyFreePreset}
+            className="px-3.5 py-1.5 bg-indigo-50 dark:bg-indigo-900/30 border border-indigo-200 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-md text-xs font-semibold flex items-center gap-1.5 transition self-start sm:self-auto"
+          >
+            <span>⚡ Set Optimal Free Preset</span>
+          </button>
+        </div>
+
+        <div className="bg-blue-50/70 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800/60 p-3 rounded-md text-xs text-blue-800 dark:text-blue-300">
+          <strong>🔄 Dual-Provider Auto-Failover:</strong> If your selected model experiences a temporary capacity spike (e.g. Gemini 503 high demand), Job Jet automatically retries with exponential backoff and transparently fails over to your secondary provider if configured.
+        </div>
+
+        <div className="space-y-3 pt-1">
+          {renderTaskModelCard(
+            'extraction',
+            '1. Document Extraction (Resume & LinkedIn PDF)',
+            'Extracts structured candidate profile data. Uses a multimodal, large-context model.',
+            'Multimodal / Smart Model',
+            [
+              { value: 'google/gemini-2.0-flash-exp:free', label: 'google/gemini-2.0-flash-exp:free (Recommended Free Multimodal)' },
+              { value: 'meta-llama/llama-3.2-11b-vision-instruct:free', label: 'meta-llama/llama-3.2-11b-vision-instruct:free (Free Vision)' },
+              { value: 'qwen/qwen-2.5-vl-72b-instruct:free', label: 'qwen/qwen-2.5-vl-72b-instruct:free (72B Vision Free)' },
+              { value: 'google/gemini-2.5-flash', label: 'google/gemini-2.5-flash' },
+              { value: 'openai/gpt-4o-mini', label: 'openai/gpt-4o-mini' },
+            ],
+            [
+              { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash (Recommended Free - 1M Multimodal)' },
+              { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
+              { value: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
+              { value: 'gemini-3.1-pro-preview', label: 'gemini-3.1-pro-preview (Deep Reasoning)' },
+            ]
+          )}
+
+          {renderTaskModelCard(
+            'scoring',
+            '2. Job Match Matrix & Scoring',
+            'Evaluates scraped job descriptions against candidate resume across 4 dimensions.',
+            'High-Reasoning Text LLM',
+            [
+              { value: 'meta-llama/llama-3.3-70b-instruct:free', label: 'meta-llama/llama-3.3-70b-instruct:free (Recommended Free - Top 70B)' },
+              { value: 'qwen/qwen-2.5-72b-instruct:free', label: 'qwen/qwen-2.5-72b-instruct:free (72B Free)' },
+              { value: 'deepseek/deepseek-r1:free', label: 'deepseek/deepseek-r1:free (Reasoning Free)' },
+              { value: 'mistralai/mistral-small-24b-instruct-2501:free', label: 'mistralai/mistral-small-24b-instruct:free' },
+              { value: 'google/gemini-2.0-flash-exp:free', label: 'google/gemini-2.0-flash-exp:free' },
+            ],
+            [
+              { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash (Recommended Free)' },
+              { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
+              { value: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
+            ]
+          )}
+
+          {renderTaskModelCard(
+            'form_filling',
+            '3. ATS Form Question Solver',
+            'Generates factual, resume-grounded answers for Easy Apply application questions.',
+            'Fast & Accurate LLM',
+            [
+              { value: 'meta-llama/llama-3.3-70b-instruct:free', label: 'meta-llama/llama-3.3-70b-instruct:free (Recommended Free)' },
+              { value: 'qwen/qwen-2.5-72b-instruct:free', label: 'qwen/qwen-2.5-72b-instruct:free' },
+              { value: 'google/gemini-2.0-flash-exp:free', label: 'google/gemini-2.0-flash-exp:free' },
+              { value: 'meta-llama/llama-3.1-8b-instruct:free', label: 'meta-llama/llama-3.1-8b-instruct:free (Ultra Fast)' },
+            ],
+            [
+              { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash (Recommended Free)' },
+              { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
+              { value: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
+            ]
+          )}
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 border-t border-gray-100 dark:border-gray-700">
           <div>
             <label className="block text-sm font-medium mb-1">Max Approved Jobs per Run</label>
-            <input type="number" value={data.settings?.ai?.max_approved_jobs || 10} onChange={e => updateAi('max_approved_jobs', Number(e.target.value))} className={inputCls} />
+            <input type="number" value={data.settings?.ai?.max_approved_jobs || 15} onChange={e => updateAi('max_approved_jobs', Number(e.target.value))} className={inputCls} />
           </div>
           <div>
-            <label className="block text-sm font-medium mb-1">Match Threshold</label>
+            <label className="block text-sm font-medium mb-1">Match Threshold (%)</label>
             <input type="number" min="0" max="100" value={data.settings?.evaluation_weights?.match_threshold || 80} onChange={e => updateWeights('match_threshold', e.target.value)} className={inputCls} />
           </div>
         </div>
@@ -1435,7 +1666,9 @@ const SettingsTab = () => {
 
       <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow space-y-4">
         <h2 className="text-lg font-semibold">Apify Scraper Configuration</h2>
-        <p className="text-xs text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/20 p-2 rounded">Job titles and locations are pulled from your Candidate Profile, not configured here.</p>
+        <div className="bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 p-3 rounded-md text-xs text-emerald-800 dark:text-emerald-300">
+          <strong>✓ Intelligent Role Relevance Filter Active:</strong> Job titles and locations are dynamically injected from your Candidate Profile. Off-target disciplines (e.g. Frontend Developer when searching for UI/UX Designer) are automatically detected and filtered out prior to scoring.
+        </div>
         
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>

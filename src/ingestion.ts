@@ -37,8 +37,17 @@ async function fetchFromApify(settings: Settings): Promise<void> {
   console.log(chalk.blue.bold(`\n🌍 [APIFY]`), `Triggering actor: ${actorId}...`);
 
   try {
-    const input = settings.ingestion.apify_input || {};
+    const input: Record<string, any> = { ...settings.ingestion.apify_input };
     
+    // Default to at least 40 jobs if not configured or too small
+    if (!input.rows || input.rows <= 10) {
+      input.rows = 40;
+    }
+    // Default easyApply to true if not explicitly false
+    if (input.easyApply === undefined) {
+      input.easyApply = true;
+    }
+
     // Inject dynamic search terms from the AI Candidate Profile
     const profile = loadCandidateProfile();
     if (profile.search?.titles?.length > 0) {
@@ -48,14 +57,39 @@ async function fetchFromApify(settings: Settings): Promise<void> {
       input.locations = profile.search.locations;
     }
 
+    console.log(chalk.gray(`  Searching titles: ${JSON.stringify(input.titles || [])}`));
+    console.log(chalk.gray(`  Searching locations: ${JSON.stringify(input.locations || [])}`));
+    console.log(chalk.gray(`  Max rows requested: ${input.rows}, Easy Apply: ${input.easyApply}`));
+
     const run = await client.actor(actorId).call(input);
     
     console.log(chalk.gray(`  Actor run finished (ID: ${run.id}). Fetching dataset...`));
 
     const { items } = await client.dataset(run.defaultDatasetId).listItems();
     
-    fs.writeFileSync(paths.jobsRaw, JSON.stringify(items, null, 2), "utf-8");
-    console.log(chalk.green(`  ✔ Saved ${items.length} raw jobs to data/jobs_raw.json`));
+    // Merge new items with existing raw jobs by URL/ID so previous scrapes are not lost
+    let existingJobs: any[] = [];
+    if (fs.existsSync(paths.jobsRaw)) {
+      try {
+        existingJobs = JSON.parse(fs.readFileSync(paths.jobsRaw, "utf-8"));
+      } catch {}
+    }
+
+    const seenUrls = new Set(existingJobs.map((j: any) => j.url || j.jobUrl || j.applyUrl || j.id));
+    let newItemsCount = 0;
+    for (const item of items) {
+      const url = (item as any).url || (item as any).jobUrl || (item as any).applyUrl || (item as any).id;
+      if (url && !seenUrls.has(url)) {
+        existingJobs.push(item);
+        seenUrls.add(url);
+        newItemsCount++;
+      }
+    }
+
+    // If existing jobs was empty, just write items
+    const toSave = existingJobs.length > 0 ? existingJobs : items;
+    fs.writeFileSync(paths.jobsRaw, JSON.stringify(toSave, null, 2), "utf-8");
+    console.log(chalk.green(`  ✔ Ingested ${items.length} jobs (${newItemsCount} new, total ${toSave.length} in jobs_raw.json)`));
   } catch (err) {
     console.error(
       chalk.red.bold(`✖ [APIFY ERROR]`),
@@ -225,8 +259,8 @@ export function applyBlacklist(
 // ============================================================
 
 /**
- * Removes jobs that the user has already applied to in previous runs.
- * Checks against `data/history.json`.
+ * Removes jobs that the user has already successfully applied to in previous runs.
+ * Only filters entries with status === "applied" (temporary skips/errors are not permanently blocked).
  */
 export function deduplicateHistory(jobs: RawJob[]): RawJob[] {
   const history = loadHistory();
@@ -234,7 +268,8 @@ export function deduplicateHistory(jobs: RawJob[]): RawJob[] {
     return jobs;
   }
 
-  const appliedUrls = new Set(history.map((h) => h.url));
+  // ONLY drop jobs that have actually been submitted / applied to
+  const appliedUrls = new Set(history.filter((h) => h.status === "applied").map((h) => h.url));
   const fresh: RawJob[] = [];
   let dupes = 0;
 
@@ -254,7 +289,7 @@ export function deduplicateHistory(jobs: RawJob[]): RawJob[] {
   if (dupes > 0) {
     console.log(
       chalk.blue.bold(`\n📋 [HISTORY]`),
-      `${dupes} duplicates removed, ${fresh.length} new jobs remain`
+      `${dupes} already-applied jobs excluded, ${fresh.length} fresh jobs remain`
     );
   }
 
@@ -262,12 +297,93 @@ export function deduplicateHistory(jobs: RawJob[]): RawJob[] {
 }
 
 // ============================================================
+// Intelligent Role Relevance Filter
+// ============================================================
+
+/**
+ * Filters out jobs whose primary role category conflicts with the candidate's target roles.
+ * For example, if candidate targets are UI/UX Designer, Product Designer (Design track),
+ * jobs like Frontend Developer, Software Engineer, Backend Engineer are filtered out.
+ */
+export function filterByRoleRelevance(jobs: RawJob[], targetTitles: string[]): RawJob[] {
+  if (!targetTitles || targetTitles.length === 0) return jobs;
+
+  const targetsLower = targetTitles.map((t) => t.toLowerCase());
+  const isDesignCandidate = targetsLower.some((t) =>
+    t.includes("design") || t.includes("ux") || t.includes("ui") || t.includes("product designer")
+  );
+  const isDeveloperCandidate = targetsLower.some((t) =>
+    t.includes("developer") || t.includes("engineer") || t.includes("programmer") || t.includes("coder")
+  );
+
+  const devRoleKeywords = [
+    "frontend developer", "front end developer", "backend developer", "back end developer",
+    "full stack developer", "fullstack developer", "full stack engineer", "software engineer",
+    "software developer", "react developer", "web developer", "java developer", "python developer",
+    "devops engineer", "qa engineer", "test engineer", "mobile developer", "ios developer", "android developer"
+  ];
+
+  const designRoleKeywords = [
+    "ux designer", "ui designer", "product designer", "interaction designer", "visual designer",
+    "user experience designer", "user interface designer", "ui/ux", "ux/ui"
+  ];
+
+  const passed: RawJob[] = [];
+  let filteredCount = 0;
+
+  for (const job of jobs) {
+    const titleLower = job.title.toLowerCase();
+
+    // Candidate is in Design track, but scraped job is purely Engineering/Development
+    if (isDesignCandidate && !isDeveloperCandidate) {
+      const isDevRole = devRoleKeywords.some((kw) => titleLower.includes(kw));
+      const hasDesignInTitle = titleLower.includes("designer") || titleLower.includes("design") ||
+                               titleLower.includes("ux") || titleLower.includes("ui") ||
+                               titleLower.includes("creative");
+
+      if (isDevRole && !hasDesignInTitle) {
+        console.log(
+          chalk.red(`  ✗ Role Filtered (Mismatch): "${job.title}" at ${job.company} is a developer/engineering role (seeking Design)`)
+        );
+        filteredCount++;
+        continue;
+      }
+    }
+
+    // Candidate is Developer track, but scraped job is purely Design
+    if (isDeveloperCandidate && !isDesignCandidate) {
+      const isDesignRole = designRoleKeywords.some((kw) => titleLower.includes(kw));
+      const hasDevInTitle = titleLower.includes("developer") || titleLower.includes("engineer") || titleLower.includes("software");
+
+      if (isDesignRole && !hasDevInTitle) {
+        console.log(
+          chalk.red(`  ✗ Role Filtered (Mismatch): "${job.title}" at ${job.company} is a design role (seeking Engineering)`)
+        );
+        filteredCount++;
+        continue;
+      }
+    }
+
+    passed.push(job);
+  }
+
+  if (filteredCount > 0) {
+    console.log(
+      chalk.blue.bold(`\n🎯 [ROLE FILTER]`),
+      `${filteredCount} off-target discipline jobs filtered out, ${passed.length} relevant jobs retained.`
+    );
+  }
+
+  return passed;
+}
+
+// ============================================================
 // Combined Pipeline
 // ============================================================
 
 /**
- * Runs the full ingestion pipeline: parse → blacklist → deduplicate.
- * Returns the filtered array of jobs ready for Gemini scoring.
+ * Runs the full ingestion pipeline: parse → blacklist → role relevance → deduplicate.
+ * Returns the filtered array of jobs ready for AI scoring.
  */
 export async function runIngestionPipeline(
   blacklist: Blacklist,
@@ -278,8 +394,13 @@ export async function runIngestionPipeline(
   }
 
   const raw = ingestRawJobs();
-  const filtered = applyBlacklist(raw, blacklist);
-  const deduped = deduplicateHistory(filtered);
+  const blacklisted = applyBlacklist(raw, blacklist);
+
+  // Apply intelligent role relevance filter against candidate profile target titles
+  const profile = loadCandidateProfile();
+  const roleFiltered = filterByRoleRelevance(blacklisted, profile.search?.titles || []);
+
+  const deduped = deduplicateHistory(roleFiltered);
 
   if (deduped.length === 0) {
     console.log(
