@@ -89,6 +89,7 @@ export async function launchBrowser(
         const child = spawn(systemBrowser, [
           `--remote-debugging-port=9222`,
           `--user-data-dir=${userDataDir}`,
+          '--lang=en-US',
           '--start-maximized',
           'https://www.linkedin.com/login'
         ], { detached: true, stdio: 'ignore' });
@@ -99,7 +100,7 @@ export async function launchBrowser(
         const psScript = `
 $taskName = "JobHuntLaunchChrome"
 $chromePath = "${systemBrowser}"
-$args = "--remote-debugging-port=9222 --user-data-dir=\`"${userDataDir}\`" --start-maximized https://www.linkedin.com/login"
+$args = "--remote-debugging-port=9222 --user-data-dir=\`"${userDataDir}\`" --lang=en-US --start-maximized https://www.linkedin.com/login"
 $action = New-ScheduledTaskAction -Execute $chromePath -Argument $args
 $principal = New-ScheduledTaskPrincipal -UserId (Get-CimInstance Win32_ComputerSystem).UserName -LogonType Interactive
 $task = New-ScheduledTask -Action $action -Principal $principal
@@ -167,6 +168,21 @@ Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null
     context.pages().length > 0 ? context.pages()[0] : await context.newPage();
 
   await page.bringToFront().catch(() => {});
+
+  // Force English locale and language headers on the context and cookies
+  try {
+    await context.setExtraHTTPHeaders({
+      "Accept-Language": "en-US,en;q=0.9",
+    });
+    await context.addCookies([
+      {
+        name: "lang",
+        value: "v=2&lang=en-us",
+        domain: ".linkedin.com",
+        path: "/",
+      },
+    ]);
+  } catch {}
 
   console.log(chalk.green.bold(`  ✔ Browser launched successfully`));
 

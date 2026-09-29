@@ -45,7 +45,7 @@ import {
 } from "./src/evaluator.js";
 import { exportExternalShortlist, openExternalJobs } from "./src/external.js";
 import { auditAndRefineResume, alignLinkedInProfile, prepInterview } from "./src/optimizer.js";
-import { confirmShortlist } from "./src/cli.js";
+import { confirmShortlist, ensureApplicationProfile } from "./src/cli.js";
 import type { SolverContext } from "./src/types.js";
 import { launchBrowser, closeBrowser } from "./src/browser/session.js";
 import {
@@ -220,11 +220,11 @@ async function runPhase2And3(
 
       try {
         // Navigate and open Easy Apply
-        const opened = await openEasyApply(session.page, job.url);
+        const openResult = await openEasyApply(session.page, job.url);
 
-        if (!opened) {
+        if (!openResult.opened) {
           status = "skipped";
-          message = "Easy Apply button not found";
+          message = openResult.message;
           console.log(
             chalk.yellow(`  ↳ Skipped: ${message}`)
           );
@@ -396,6 +396,13 @@ async function main(): Promise<void> {
   const flags = parseCliFlags();
   ensureDirectories();
 
+  try {
+    const { discoverModels } = await import("./src/ai/discovery.js");
+    await discoverModels();
+  } catch (err) {
+    console.warn(chalk.yellow("⚠ Could not discover AI models. Using default fallback."));
+  }
+
   // --- Phase 0: Upstream Toolkit Intercept ---
   const isPhase0 = flags.auditResume || flags.alignLinkedin || flags.prepInterview;
   if (isPhase0) {
@@ -484,6 +491,9 @@ async function main(): Promise<void> {
   }
 
   // --- Phase 2: Interactive CLI ---
+  if (easyApplyJobs.length > 0) {
+    await ensureApplicationProfile();
+  }
   const selectedEasyApply = flags.autoConfirm ? easyApplyJobs : await confirmShortlist(easyApplyJobs);
 
   // --- Phase 3: Browser Automation ---

@@ -8,20 +8,35 @@ ingestion:
     enrichCompany: false
     enrichCompanyWebsite: false
     workTypes: []
+    searchTerms: ''
 ai:
   provider: gemini
-  model: gemini-2.5-flash
+  model: gemini-3.1-flash-lite
   max_approved_jobs: 15
+  providers:
+    gemini:
+      enabled: true
+    openrouter:
+      enabled: true
+    groq:
+      enabled: true
+    mistral:
+      enabled: true
+  priority_list:
+    - provider: gemini
+      model: gemini-3.1-flash-lite
+    - provider: openrouter
+      model: openrouter/free
   models:
     extraction:
       provider: gemini
-      model: gemini-2.5-flash
+      model: gemini-3.1-flash-lite
     scoring:
       provider: gemini
-      model: gemini-2.5-flash
+      model: gemini-3.1-flash-lite
     form_filling:
       provider: gemini
-      model: gemini-2.5-flash
+      model: gemini-3.5-flash
 evaluation_weights:
   core_technical_stack: 40
   seniority_alignment: 30

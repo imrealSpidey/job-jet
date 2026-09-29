@@ -4,12 +4,13 @@ import multer from "multer";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { runIngestionPipeline } from "./ingestion.js";
-import { evaluateJobs, readApprovedJobs, writeApprovedJobs, getEvaluationProgress } from "./evaluator.js";
+import { runIngestionPipeline, filterByRoleRelevance, applyBlacklist, deduplicateHistory } from "./ingestion.js";
+import { evaluateJobs, readApprovedJobs, writeApprovedJobs, getEvaluationProgress, stopEvaluation } from "./evaluator.js";
 import { loadSourceOfTruth, loadSettings, loadBlacklist, loadCandidateProfile, saveCandidateProfile, paths } from "./config.js";
 import { extractCandidateProfile } from "./profileBuilder.js";
 import { getAutomationProgress, startAutomation, stopAutomation } from "./automationRunner.js";
-import type { Settings, CandidateProfile } from "./types.js";
+import type { Settings, CandidateProfile, RawJob } from "./types.js";
+import { normalizeRawJobInput } from "./types.js";
 import chalk from "chalk";
 import dotenv from "dotenv";
 
@@ -162,12 +163,39 @@ app.post("/api/pipeline/extract-profile", async (req, res) => {
 // Pipeline Endpoints
 // ============================================================
 
+let lastScrapeBatchId: string | null = null;
+
 app.post("/api/pipeline/ingest", async (req, res) => {
   try {
     const settings = loadSettings();
+    const { query, rows } = req.body || {};
+    let settingsUpdated = false;
+    
+    if (query || rows !== undefined) {
+      if (!settings.ingestion) settings.ingestion = { mode: "api", apify_input: {} };
+      if (!settings.ingestion.apify_input) settings.ingestion.apify_input = {};
+      
+      if (query !== undefined && query !== settings.ingestion.apify_input.searchTerms) {
+        settings.ingestion.apify_input.searchTerms = query;
+        settingsUpdated = true;
+      }
+      if (rows !== undefined && rows !== settings.ingestion.apify_input.rows) {
+        settings.ingestion.apify_input.rows = Number(rows);
+        settingsUpdated = true;
+      }
+      
+      if (settingsUpdated) {
+        fs.writeFileSync(paths.settingsYaml, yaml.dump(settings), "utf8");
+      }
+    }
+    
     const blacklist = loadBlacklist();
     const jobs = await runIngestionPipeline(blacklist, settings);
-    res.json({ success: true, count: jobs.length });
+    const batchId = (jobs[0] as any)?.scrapeBatchId || lastScrapeBatchId;
+    if (batchId) {
+      lastScrapeBatchId = batchId;
+    }
+    res.json({ success: true, count: jobs.length, batchId: lastScrapeBatchId });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -189,17 +217,53 @@ app.post("/api/pipeline/evaluate", async (req, res) => {
       return res.json({ success: true, message: "Evaluation already in progress", progress });
     }
 
+    const { batchId } = req.body || {};
     const settings = loadSettings();
     const rawJobsText = fs.readFileSync(paths.jobsRaw, "utf8");
-    const jobs = JSON.parse(rawJobsText);
+    let allJobs = JSON.parse(rawJobsText);
+
+    // Default to the latest batch if not explicitly specified
+    let targetBatchId = batchId;
+    if (!targetBatchId || targetBatchId === "latest") {
+      targetBatchId = lastScrapeBatchId || allJobs[allJobs.length - 1]?.scrapeBatchId;
+    }
+
+    let targetJobs: any[];
+    if (targetBatchId && targetBatchId !== "all") {
+      targetJobs = allJobs.filter((j: any) => j.scrapeBatchId === targetBatchId);
+    } else {
+      targetJobs = allJobs;
+    }
+
+    if (targetJobs.length === 0) {
+      return res.status(400).json({ error: "No jobs found for the selected batch." });
+    }
+
+    // Always apply deterministic pre-filters so irrelevant jobs are removed before AI
+    const blacklist = loadBlacklist();
+    const normalized = targetJobs.map((j: any) => normalizeRawJobInput(j)) as RawJob[];
+    const blacklisted = applyBlacklist(normalized, blacklist);
+    const profile = loadCandidateProfile();
+    const roleFiltered = filterByRoleRelevance(blacklisted, profile.search?.titles || []);
+    const filteredJobs = deduplicateHistory(roleFiltered);
+
     const resumeText = await loadSourceOfTruth();
 
     // Run evaluation in the background without blocking the HTTP request
-    evaluateJobs(jobs, resumeText, settings).catch((err) => {
+    evaluateJobs(filteredJobs, resumeText, settings).catch((err) => {
       console.error(chalk.red("Evaluation error:"), err);
     });
 
-    res.json({ success: true, message: "Evaluation started", total: jobs.length });
+    res.json({ success: true, message: "Evaluation started", total: filteredJobs.length, batchId: targetBatchId });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/pipeline/evaluate/stop", (req, res) => {
+  try {
+    stopEvaluation();
+    res.json({ success: true, message: "Evaluation stopped" });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -241,8 +305,9 @@ app.post("/api/pipeline/apply", async (req, res) => {
     if (progress.isRunning) {
       return res.json({ success: true, message: "Automation already in progress", progress });
     }
-    const dryRun = Boolean(req.body?.dryRun);
-    startAutomation(dryRun).catch((err) => {
+    const { batchId, dryRun } = req.body || {};
+    
+    startAutomation(Boolean(dryRun), batchId).catch((err) => {
       console.error(chalk.red("Automation runner error:"), err);
     });
     res.json({ success: true, message: "Browser automation initialized!" });
@@ -261,8 +326,47 @@ app.post("/api/pipeline/apply/stop", async (req, res) => {
 });
 
 // ============================================================
+// Job Batch Management
+// ============================================================
+
+app.delete("/api/jobs/raw/stale", (req, res) => {
+  try {
+    const olderThanDays = Number(req.query.olderThanDays) || 7;
+    if (!fs.existsSync(paths.jobsRaw)) {
+      return res.json({ success: true, removed: 0, remaining: 0 });
+    }
+    const rawJobs: any[] = JSON.parse(fs.readFileSync(paths.jobsRaw, "utf-8"));
+    const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000).toISOString();
+    const fresh = rawJobs.filter((j: any) => !j.scrapedAt || j.scrapedAt >= cutoff);
+    fs.writeFileSync(paths.jobsRaw, JSON.stringify(fresh, null, 2), "utf-8");
+    res.json({ success: true, removed: rawJobs.length - fresh.length, remaining: fresh.length });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/jobs/raw/batch/:batchId", (req, res) => {
+  try {
+    const { batchId } = req.params;
+    if (!fs.existsSync(paths.jobsRaw)) {
+      return res.json({ success: true, removed: 0, remaining: 0 });
+    }
+    const rawJobs: any[] = JSON.parse(fs.readFileSync(paths.jobsRaw, "utf-8"));
+    const filtered = rawJobs.filter((j: any) => j.scrapeBatchId !== batchId);
+    fs.writeFileSync(paths.jobsRaw, JSON.stringify(filtered, null, 2), "utf-8");
+    res.json({ success: true, removed: rawJobs.length - filtered.length, remaining: filtered.length });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
 // Start Server
 // ============================================================
+
+import("./ai/discovery.js").then(({ discoverModels }) => {
+  discoverModels().catch(err => console.warn(chalk.yellow("⚠ Could not discover AI models.")));
+}).catch(() => {});
 
 app.listen(PORT, () => {
   console.log(chalk.green(`\n🚀 Orchestrator API Server running on http://localhost:${PORT}`));

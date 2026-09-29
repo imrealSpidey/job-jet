@@ -23,7 +23,7 @@ import { z } from "zod";
  */
 export function normalizeRawJobInput(
   input: Record<string, unknown>
-): Record<string, unknown> {
+): RawJob {
   // Map Bebity's applicationsCount to our applicationsCount property
   let appsCount = input.applicationsCount ?? input.applicants ?? input.numberOfApplicants ?? input.applicantCount ?? undefined;
   if (typeof appsCount === "string") {
@@ -32,21 +32,22 @@ export function normalizeRawJobInput(
   }
 
   return {
-    id: input.id ?? input.jobId ?? input.idString ?? undefined,
-    url: input.url ?? input.jobUrl ?? input.link ?? input.applyUrl ?? "",
-    title: input.title ?? input.jobTitle ?? input.position ?? "",
-    company: input.company ?? input.companyName ?? input.employer ?? "",
-    location: input.location ?? input.jobLocation ?? input.place ?? "Unknown",
-    // Prioritize plain text description from Bebity
-    description: input.description ?? input.jobDescription ?? input.descriptionText ?? "",
-    postedAt: input.postedAt ?? input.postedDate ?? input.publishedAt ?? input.datePosted ?? undefined,
+    ...input,
+    id: input.id ? String(input.id) : (input.jobId ? String(input.jobId) : (input.idString ? String(input.idString) : undefined)),
+    url: String(input.url ?? input.jobUrl ?? input.link ?? input.applyUrl ?? ""),
+    title: String(input.title ?? input.jobTitle ?? input.position ?? ""),
+    company: String(input.company ?? input.companyName ?? input.employer ?? ""),
+    location: String(input.location ?? input.jobLocation ?? input.place ?? "Unknown"),
+    description: String(input.description ?? input.jobDescription ?? input.descriptionText ?? ""),
+    postedAt: input.postedAt ? String(input.postedAt) : (input.postedDate ? String(input.postedDate) : (input.publishedAt ? String(input.publishedAt) : (input.datePosted ? String(input.datePosted) : undefined))),
     applicationsCount: appsCount,
-    easyApply: input.easyApply ?? input.isEasyApply ?? input.easy_apply ?? undefined,
-    // Map applyType if Bebity gives it explicitly
-    applyType: input.applyType ?? undefined,
-    salaryMin: input.salaryMin ?? undefined,
-    salaryMax: input.salaryMax ?? undefined,
-  };
+    easyApply: input.easyApply !== undefined ? Boolean(input.easyApply) : (input.isEasyApply !== undefined ? Boolean(input.isEasyApply) : (input.easy_apply !== undefined ? Boolean(input.easy_apply) : undefined)),
+    applyType: input.applyType === "EASY_APPLY" || input.applyType === "EXTERNAL" ? input.applyType : undefined,
+    salaryMin: typeof input.salaryMin === "number" ? input.salaryMin : undefined,
+    salaryMax: typeof input.salaryMax === "number" ? input.salaryMax : undefined,
+    scrapedAt: input.scrapedAt ? String(input.scrapedAt) : undefined,
+    scrapeBatchId: input.scrapeBatchId ? String(input.scrapeBatchId) : undefined,
+  } as RawJob;
 }
 
 export const RawJobSchema = z.object({
@@ -62,6 +63,8 @@ export const RawJobSchema = z.object({
   applyType: z.enum(["EASY_APPLY", "EXTERNAL"]).optional(),
   salaryMin: z.number().optional(),
   salaryMax: z.number().optional(),
+  scrapedAt: z.string().optional(),
+  scrapeBatchId: z.string().optional(),
 });
 
 export type RawJob = z.infer<typeof RawJobSchema>;
@@ -146,9 +149,22 @@ export const CandidateProfileSchema = z.object({
     city: z.string().nullable().default(null),
   }).default({}),
   professional: z.object({
-    salary_expectation: z.string().nullable().default(null),
+    current_salary: z.object({
+      amount: z.number().nullable().default(null),
+      currency: z.string().default("USD"),
+      period: z.enum(["yearly", "monthly", "hourly"]).default("yearly"),
+    }).default({}),
+    expected_salary: z.object({
+      amount: z.number().nullable().default(null),
+      currency: z.string().default("USD"),
+      period: z.enum(["yearly", "monthly", "hourly"]).default("yearly"),
+    }).default({}),
+    salary_expectation: z.string().nullable().default(null), // legacy fallback
     years_of_experience: z.string().nullable().default(null),
-    notice_period: z.string().nullable().default(null),
+    notice_period: z.object({
+      value: z.number().nullable().default(null),
+      unit: z.enum(["days", "weeks", "months", "immediate"]).default("days"),
+    }).nullable().default(null),
   }).default({}),
   links: z.object({
     linkedin_profile: z.string().nullable().default(null),
@@ -176,7 +192,7 @@ export type CandidateProfile = z.infer<typeof CandidateProfileSchema>;
 
 export const TaskModelSchema = z.object({
   provider: z.enum(["gemini", "openrouter"]).default("gemini"),
-  model: z.string().default("gemini-2.5-flash"),
+  model: z.string().default("gemini-flash-lite-latest"),
 });
 export type TaskModelConfig = z.infer<typeof TaskModelSchema>;
 
@@ -192,15 +208,32 @@ export const SettingsSchema = z.object({
   ai: z.object({
     // Legacy single-model fields (kept for backward compat with old settings.yaml)
     provider: z.enum(["gemini", "openrouter"]).default("gemini"),
-    model: z.string().default("gemini-2.5-flash"),
+    model: z.string().default("gemini-flash-lite-latest"),
     max_approved_jobs: z.number().int().positive().default(15),
+
+    // Multi-provider settings
+    providers: z.record(z.string(), z.object({
+      enabled: z.boolean().default(true),
+      baseUrl: z.string().optional()
+    })).default({
+      gemini: { enabled: true },
+      openrouter: { enabled: true },
+      groq: { enabled: true },
+      mistral: { enabled: true }
+    }),
+
+    // Priority list for task fallback cascade
+    priority_list: z.array(TaskModelSchema).default([
+      { provider: "gemini", model: "gemini-3.1-flash-lite" },
+      { provider: "openrouter", model: "openrouter/free" }
+    ]),
 
     // Task-specific model overrides (new)
     models: z.object({
-      extraction: TaskModelSchema.default({ provider: "gemini", model: "gemini-2.5-flash" }),
-      scoring: TaskModelSchema.default({ provider: "gemini", model: "gemini-2.5-flash" }),
-      form_filling: TaskModelSchema.default({ provider: "gemini", model: "gemini-2.5-flash" }),
-    }).default({}),
+      extraction: TaskModelSchema.default({ provider: "gemini", model: "gemini-3.1-flash-lite" }),
+      scoring: TaskModelSchema.default({ provider: "gemini", model: "gemini-3.1-flash-lite" }),
+      form_filling: TaskModelSchema.default({ provider: "gemini", model: "gemini-3.5-flash" }),
+    }).nullable().default(null),
   }),
 
   evaluation_weights: z.object({
@@ -282,3 +315,22 @@ export interface ApplicationResult {
   message?: string;
   answers: FormAnswer[];
 }
+
+export interface DetectedField {
+  type: 'text' | 'textarea' | 'select' | 'radio' | 'file' | 'combobox' | 'checkbox';
+  htmlType?: string; // e.g. 'number', 'tel'
+  label: string;
+  selector: string;
+  fieldsetIndex?: number;
+  checkboxIndex?: number;
+  options?: string[];
+  required: boolean;
+  // Field Constraints
+  pattern?: string;
+  min?: string;
+  max?: string;
+  maxLength?: string;
+  minLength?: string;
+  inputMode?: string;
+}
+

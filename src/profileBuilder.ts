@@ -1,5 +1,6 @@
 import { type CandidateProfile, type Settings } from "./types.js";
 import { generateStructuredResponse, getModelForTask } from "./ai.js";
+import chalk from "chalk";
 
 export async function extractCandidateProfile(resumeText: string, settings: Settings): Promise<Partial<CandidateProfile>> {
   const { config: aiConfig, apiKeys, fallbackConfig, fallbackApiKeys } = getModelForTask(settings, "extraction");
@@ -22,7 +23,7 @@ The output MUST be a raw JSON object with this exact schema:
 {
   "search": { "titles": ["str"], "locations": ["str"] },
   "personal_info": { "phone": "str|null", "email": "str|null", "city": "str|null" },
-  "professional": { "salary_expectation": "str|null", "years_of_experience": "str|null", "notice_period": "str|null" },
+  "professional": { "salary_expectation": "str|null", "years_of_experience": "str|null", "notice_period": { "value": "number|null", "unit": "days|weeks|months|immediate" } },
   "links": { "linkedin_profile": "str|null", "portfolio_website": "str|null", "github": "str|null" },
   "education": { "degree": "str|null", "university": "str|null", "gpa": "str|null", "graduation_year": "str|null" },
   "compliance": {
@@ -46,6 +47,10 @@ The output MUST be a raw JSON object with this exact schema:
       fallbackApiKeys
     );
     parsed.raw_extracted = true;
+    
+    console.log(chalk.blue(`\n[PROFILE] Extracted candidate location: ${JSON.stringify(parsed.search?.locations || [])}`));
+    console.log(chalk.blue(`[PROFILE] Extracted target/current titles: ${JSON.stringify(parsed.search?.titles || [])}`));
+    
     return parsed;
   } catch (error: any) {
     console.error("Failed to extract candidate profile:", error);

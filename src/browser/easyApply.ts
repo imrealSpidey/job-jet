@@ -36,6 +36,103 @@ import {
 const MODAL_TIMEOUT = 10_000;
 const NAVIGATION_TIMEOUT = 30_000;
 
+/**
+ * Dynamically locates the active Easy Apply modal container.
+ * LinkedIn's SDUI framework has moved away from standard selectors like
+ * div[role="dialog"] and .artdeco-modal. This function tries multiple
+ * strategies to find the modal.
+ */
+async function locateActiveModal(page: Page): Promise<ReturnType<Page["locator"]> | null> {
+  // Strategy 1: Traditional selectors (still works on some LinkedIn versions)
+  const traditionalSelectors = [
+    'div[role="dialog"]',
+    '.artdeco-modal',
+    '.jobs-easy-apply-modal',
+    'div.artdeco-modal',
+    '[data-test-modal]',
+    'div.jobs-easy-apply-content',
+    'div[class*="jobs-easy-apply"]',
+  ];
+  
+  for (const sel of traditionalSelectors) {
+    const loc = page.locator(sel).first();
+    if (await loc.isVisible({ timeout: 300 }).catch(() => false)) {
+      return loc;
+    }
+  }
+  
+  // Strategy 2: Find by content — look for "Apply to" header and get its modal ancestor
+  // Use page.evaluate to find the container, then target it with a Playwright locator
+  const containerSelector = await page.evaluate(() => {
+    // Find the "Apply to" header
+    const allHeaders = document.querySelectorAll('h2, h3, span, div');
+    for (const el of allHeaders) {
+      const text = el.textContent?.trim() || '';
+      if (text.startsWith('Apply to') && (el as HTMLElement).offsetWidth > 0) {
+        // Walk up to find a suitable container (fixed/absolute positioned, large)
+        let container = el.parentElement;
+        let depth = 0;
+        while (container && depth < 20) {
+          const style = window.getComputedStyle(container);
+          const rect = container.getBoundingClientRect();
+          if (
+            (style.position === 'fixed' || style.position === 'absolute') &&
+            rect.width > 300 && rect.height > 200
+          ) {
+            // Generate a unique selector for this element
+            if (container.id) return `#${container.id}`;
+            // Use the element's tagName + a unique attribute combo
+            const tag = container.tagName.toLowerCase();
+            const classes = Array.from(container.classList).slice(0, 3).join('.');
+            if (classes) return `${tag}.${classes}`;
+            // Last resort: use nth-child path
+            return null;
+          }
+          container = container.parentElement;
+          depth++;
+        }
+      }
+    }
+    
+    // Strategy 3: Find any large fixed overlay with form inputs
+    const allEls = document.querySelectorAll('div, section');
+    for (const el of allEls) {
+      const htmlEl = el as HTMLElement;
+      if (htmlEl.offsetWidth === 0) continue;
+      const style = window.getComputedStyle(htmlEl);
+      const rect = htmlEl.getBoundingClientRect();
+      if (
+        style.position === 'fixed' &&
+        rect.width > 300 && rect.height > 200 &&
+        htmlEl.querySelectorAll('input, select, textarea').length >= 1 &&
+        htmlEl.querySelector('button') !== null
+      ) {
+        if (htmlEl.id) return `#${htmlEl.id}`;
+        const tag = htmlEl.tagName.toLowerCase();
+        const classes = Array.from(htmlEl.classList).slice(0, 3).join('.');
+        if (classes) return `${tag}.${classes}`;
+      }
+    }
+    
+    return null;
+  }).catch(() => null);
+  
+  if (containerSelector) {
+    const loc = page.locator(containerSelector).first();
+    if (await loc.isVisible({ timeout: 300 }).catch(() => false)) {
+      return loc;
+    }
+  }
+  
+  // Strategy 4: Use text-based Playwright locator as last resort
+  const textLoc = page.locator(':has(h2:has-text("Apply to")):has(button:has-text("Next"), button:has-text("Review"), button:has-text("Submit"))').last();
+  if (await textLoc.isVisible({ timeout: 300 }).catch(() => false)) {
+    return textLoc;
+  }
+  
+  return null;
+}
+
 // ============================================================
 // 1. Navigate to Job & Open Easy Apply
 // ============================================================
@@ -225,35 +322,174 @@ export async function openEasyApply(
     };
     page.context().on('page', pageHandler);
 
+    // Multi-strategy click: LinkedIn's SDUI buttons may not respond to all click methods
     try {
-      await applyBtn.click({ force: true });
-    } catch (e: any) {
-      page.context().off('page', pageHandler);
-      if (e.message?.includes("closed")) {
+      // Strategy 1: Standard Playwright click (respects event listeners properly)
+      await applyBtn.click({ timeout: 5000 });
+    } catch (clickErr: any) {
+      if (clickErr?.message?.includes("closed")) {
+        page.context().off('page', pageHandler);
         return { opened: false, reason: "browser_closed", message: "Browser closed during click" };
+      }
+      // Strategy 2: Fallback to native DOM click
+      console.log(chalk.gray(`    ↻ Playwright click failed, trying native DOM click...`));
+      try {
+        await applyBtn.evaluate(el => (el as HTMLElement).click());
+      } catch (e2: any) {
+        if (e2?.message?.includes("closed")) {
+          page.context().off('page', pageHandler);
+          return { opened: false, reason: "browser_closed", message: "Browser closed during click" };
+        }
       }
     }
 
-    // Wait for the modal dialog to appear
-    const modal = page.locator('div[role="dialog"], .jobs-easy-apply-modal, div.artdeco-modal').first();
-    try {
-      if (newPageOpened) {
-        page.context().off('page', pageHandler);
-        console.log(chalk.yellow(`    ⚠ Clicking Apply opened a new tab. This is an external application.`));
-        return { opened: false, reason: "external_apply", message: "External apply only (opened new tab)" };
-      }
+    // Small wait for any dialog to render
+    await new Promise(r => setTimeout(r, 2000));
 
-      await modal.waitFor({ state: "visible", timeout: MODAL_TIMEOUT });
-    } catch {
+    if (newPageOpened) {
       page.context().off('page', pageHandler);
-      
-      if (newPageOpened) {
-        console.log(chalk.yellow(`    ⚠ Clicking Apply opened a new tab. This is an external application.`));
-        return { opened: false, reason: "external_apply", message: "External apply only (opened new tab)" };
-      }
+      console.log(chalk.yellow(`    ⚠ Clicking Apply opened a new tab. This is an external application.`));
+      return { opened: false, reason: "external_apply", message: "External apply only (opened new tab)" };
+    }
 
-      console.warn(chalk.yellow(`    ⚠ Apply clicked, but application modal did not appear.`));
-      return { opened: false, reason: "modal_timeout", message: "Application modal did not appear after clicking Apply" };
+    // Check for "Continue applying" / resume draft confirmation dialog
+    // LinkedIn sometimes shows a confirmation when you have a previously started application
+    const continueApplyingBtn = page.locator('button:has-text("Continue applying"), button:has-text("Discard"), button:has-text("Start over")').first();
+    if (await continueApplyingBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+      console.log(chalk.gray(`    ↻ Found "Continue applying" dialog, clicking to resume...`));
+      const continueBtn = page.locator('button:has-text("Continue applying")').first();
+      if (await continueBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+        await continueBtn.click().catch(() => {});
+      } else {
+        // If there's no "Continue" but there's "Discard", click that to start fresh
+        const discardBtn = page.locator('button:has-text("Discard")').first();
+        if (await discardBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+          await discardBtn.click().catch(() => {});
+          await new Promise(r => setTimeout(r, 1500));
+          // Re-click the apply button after discarding
+          await applyBtn.click({ timeout: 5000 }).catch(() => {});
+        }
+      }
+      await new Promise(r => setTimeout(r, 2000));
+    }
+
+    // Wait for the modal dialog to appear — try multiple selectors including LinkedIn's
+    // new SDUI-based overlay/modal patterns
+    const modalSelectors = [
+      'div[role="dialog"]',
+      '.jobs-easy-apply-modal',
+      'div.artdeco-modal',
+      '[data-test-modal]',
+      'div.jobs-easy-apply-content',
+      'div[class*="jobs-easy-apply"]',
+    ];
+    
+    let modalFound = false;
+    const combinedSelector = modalSelectors.join(', ');
+    const modal = page.locator(combinedSelector).first();
+    
+    try {
+      await modal.waitFor({ state: "visible", timeout: MODAL_TIMEOUT });
+      modalFound = true;
+    } catch {
+      // Standard selectors didn't find the modal. LinkedIn's new SDUI may use
+      // completely different DOM structure. Try to find it by content.
+      console.log(chalk.gray(`    ↻ Standard modal selectors failed, searching by content...`));
+      
+      // Search for the modal by finding "Apply to" header text and walking up
+      const containerInfo = await page.evaluate(() => {
+        // Strategy: find the element containing "Apply to" which is the modal header
+        const allElements = document.querySelectorAll('h2, h3, [class*="header"], [class*="title"]');
+        for (const el of allElements) {
+          if (el.textContent?.trim().startsWith("Apply to")) {
+            // Walk up to find the top-level modal container
+            let container = el.parentElement;
+            let depth = 0;
+            while (container && depth < 15) {
+              const style = window.getComputedStyle(container);
+              const rect = container.getBoundingClientRect();
+              // The modal container typically: has position fixed/absolute, covers significant area,
+              // or has a backdrop/overlay as sibling
+              if (
+                (style.position === 'fixed' || style.position === 'absolute') &&
+                rect.width > 300 && rect.height > 300
+              ) {
+                return {
+                  found: true,
+                  tag: container.tagName.toLowerCase(),
+                  id: container.id || '',
+                  className: container.className?.substring?.(0, 200) || '',
+                  role: container.getAttribute('role') || '',
+                  ariaModal: container.getAttribute('aria-modal') || '',
+                  width: rect.width,
+                  height: rect.height,
+                  position: style.position,
+                };
+              }
+              container = container.parentElement;
+              depth++;
+            }
+            // Fallback: just return the parent of the header
+            const parent = el.closest('[class*="m6f"]') || el.parentElement?.parentElement?.parentElement;
+            if (parent) {
+              return {
+                found: true,
+                tag: parent.tagName.toLowerCase(),
+                id: parent.id || '',
+                className: parent.className?.substring?.(0, 200) || '',
+                role: parent.getAttribute('role') || '',
+                ariaModal: parent.getAttribute('aria-modal') || '',
+                width: parent.getBoundingClientRect().width,
+                height: parent.getBoundingClientRect().height,
+                position: window.getComputedStyle(parent).position,
+              };
+            }
+          }
+        }
+        
+        // Broadest search: any visible fixed-position large overlay
+        const fixedEls = document.querySelectorAll('*');
+        for (const el of fixedEls) {
+          const htmlEl = el as HTMLElement;
+          const style = window.getComputedStyle(htmlEl);
+          const rect = htmlEl.getBoundingClientRect();
+          if (
+            style.position === 'fixed' &&
+            rect.width > 300 && rect.height > 300 &&
+            htmlEl.offsetWidth > 0 &&
+            htmlEl.querySelectorAll('input, select, button').length > 2
+          ) {
+            return {
+              found: true,
+              tag: htmlEl.tagName.toLowerCase(),
+              id: htmlEl.id || '',
+              className: htmlEl.className?.substring?.(0, 200) || '',
+              role: htmlEl.getAttribute('role') || '',
+              ariaModal: htmlEl.getAttribute('aria-modal') || '',
+              width: rect.width,
+              height: rect.height,
+              position: style.position,
+            };
+          }
+        }
+        
+        return { found: false, tag: '', id: '', className: '', role: '', ariaModal: '', width: 0, height: 0, position: '' };
+      }).catch(() => ({ found: false, tag: '', id: '', className: '', role: '', ariaModal: '', width: 0, height: 0, position: '' }));
+      
+      if (containerInfo.found) {
+        console.log(chalk.green(`    ✔ Found modal container via content search:`));
+        console.log(chalk.gray(`      tag=${containerInfo.tag} role="${containerInfo.role}" aria-modal="${containerInfo.ariaModal}"`));
+        console.log(chalk.gray(`      class="${containerInfo.className}"`));
+        console.log(chalk.gray(`      size=${containerInfo.width}x${containerInfo.height} position=${containerInfo.position}`));
+        modalFound = true;
+        // The modal exists — we'll proceed and let the rest of the code use broader selectors
+      } else {
+        // Take a diagnostic screenshot
+        await page.screenshot({ path: "debug_after_click.png" }).catch(() => {});
+        console.warn(chalk.yellow(`    ⚠ Apply clicked, but no modal found even with content search.`));
+        page.context().off('page', pageHandler);
+        return { opened: false, reason: "modal_timeout", message: "Application modal did not appear after clicking Apply" };
+      }
     }
     
     page.context().off('page', pageHandler);
@@ -292,10 +528,13 @@ interface DetectedField {
   selector: string;
   fieldsetIndex?: number;
   checkboxIndex?: number;
-  /** For radio/select: available options */
   options?: string[];
-  /** Whether field is required */
   required: boolean;
+  metadata: {
+    inputType: string;
+    inputMode: string;
+    id: string;
+  };
 }
 
 /**
@@ -303,7 +542,7 @@ interface DetectedField {
  * of detected fields with their types, labels, and selectors.
  */
 async function detectFormFields(page: Page): Promise<DetectedField[]> {
-  const modal = page.locator('div[role="dialog"]').first();
+  const modal = await locateActiveModal(page) || page.locator('.artdeco-modal').first();
   const fields: DetectedField[] = [];
 
   // --- Text Inputs ---
@@ -317,7 +556,6 @@ async function detectFormFields(page: Page): Promise<DetectedField[]> {
     const isVisible = await input.isVisible().catch(() => false);
     if (!isVisible) continue;
 
-    // Skip file inputs and hidden fields
     const type = await input.getAttribute("type");
     if (type === "file" || type === "hidden") continue;
 
@@ -325,8 +563,8 @@ async function detectFormFields(page: Page): Promise<DetectedField[]> {
     const id = await input.getAttribute("id");
     const role = await input.getAttribute("role");
     const ariaHasPopup = await input.getAttribute("aria-haspopup");
+    const inputMode = await input.getAttribute("inputmode");
 
-    // Check if this is a typeahead/combobox
     if (role === "combobox" || ariaHasPopup === "listbox") {
       fields.push({
         type: "combobox",
@@ -334,6 +572,7 @@ async function detectFormFields(page: Page): Promise<DetectedField[]> {
         selector: id ? `#${id}` : `input[role="combobox"]`,
         required: (await input.getAttribute("required")) !== null ||
                   (await input.getAttribute("aria-required")) === "true",
+        metadata: { inputType: type || "text", inputMode: inputMode || "", id: id || "" }
       });
     } else {
       fields.push({
@@ -342,6 +581,7 @@ async function detectFormFields(page: Page): Promise<DetectedField[]> {
         selector: id ? `#${id}` : `input[type="${type || "text"}"]`,
         required: (await input.getAttribute("required")) !== null ||
                   (await input.getAttribute("aria-required")) === "true",
+        metadata: { inputType: type || "text", inputMode: inputMode || "", id: id || "" }
       });
     }
   }
@@ -363,6 +603,7 @@ async function detectFormFields(page: Page): Promise<DetectedField[]> {
       selector: id ? `#${id}` : "textarea",
       required: (await ta.getAttribute("required")) !== null ||
                 (await ta.getAttribute("aria-required")) === "true",
+      metadata: { inputType: "textarea", inputMode: "", id: id || "" }
     });
   }
 
@@ -384,6 +625,7 @@ async function detectFormFields(page: Page): Promise<DetectedField[]> {
       selector: id ? `#${id}` : "select",
       options: options.filter((o) => o.trim() !== "" && o !== "Select an option"),
       required: (await sel.getAttribute("required")) !== null,
+      metadata: { inputType: "select", inputMode: "", id: id || "" }
     });
   }
 
@@ -401,7 +643,7 @@ async function detectFormFields(page: Page): Promise<DetectedField[]> {
     const radioCount = await radios.count();
 
     if (radioCount > 0) {
-      const options: string[] = [];
+      const options = [];
       for (let j = 0; j < radioCount; j++) {
         const radio = radios.nth(j);
         const rId = await radio.getAttribute("id").catch(() => null);
@@ -423,6 +665,7 @@ async function detectFormFields(page: Page): Promise<DetectedField[]> {
         fieldsetIndex: i,
         options,
         required: true,
+        metadata: { inputType: "radio", inputMode: "", id: "" }
       });
     }
   }
@@ -445,6 +688,7 @@ async function detectFormFields(page: Page): Promise<DetectedField[]> {
       selector: `input[type="checkbox"]`,
       checkboxIndex: i,
       required: isRequired,
+      metadata: { inputType: "checkbox", inputMode: "", id: "" }
     });
   }
 
@@ -452,17 +696,18 @@ async function detectFormFields(page: Page): Promise<DetectedField[]> {
   const fileInputs = modal.locator('input[type="file"]');
   const fileCount = await fileInputs.count();
   for (let i = 0; i < fileCount; i++) {
-    const fileInput = fileInputs.nth(i);
     fields.push({
       type: "file",
       label: "Resume Upload",
       selector: 'input[type="file"]',
       required: true,
+      metadata: { inputType: "file", inputMode: "", id: "" }
     });
   }
 
   return fields;
 }
+
 
 /**
  * Extracts the label text for a form field by checking:
@@ -518,184 +763,220 @@ async function getFieldLabel(
  * Fills a single detected form field using the form solver.
  * Returns the FormAnswer used, or null if skipped.
  */
-async function fillField(
-  page: Page,
-  field: DetectedField,
-  context: SolverContext,
-  settings: Settings,
-  dryRun: boolean
-): Promise<FormAnswer | null> {
-  const answer = await solveQuestion(
-    field.label,
-    field.options || [],
-    context.resumeText,
-    settings
-  );
 
-  // If answer is halt or null:
-  if (answer.tier === "halt" || answer.answer === null) {
-    if (!field.required) {
-      console.log(chalk.gray(`    ↳ Optional field "${field.label}" skipped`));
-      return {
-        tier: "optional_skip" as any,
-        question: field.label,
-        answer: null,
-      };
+  async function fillField(
+    page: Page,
+    field: DetectedField,
+    context: SolverContext,
+    settings: Settings,
+    dryRun: boolean
+  ): Promise<FormAnswer | null> {
+    // 1. Get initial semantic answer from solver
+    const initialAnswer = await solveQuestion(field.label, field.options || [], context.resumeText, settings);
+    
+    if (initialAnswer.tier === "halt" || initialAnswer.answer === null) {
+      if (!field.required) {
+        console.log(chalk.gray(`    ⏭ Optional field "${field.label}" skipped`));
+        return { tier: "optional_skip" as any, question: field.label, answer: null };
+      }
+      return initialAnswer;
     }
-    return answer;
+
+    if (dryRun) {
+      console.log(chalk.gray(`    [DRY-RUN] Would fill "${field.label}" with "${initialAnswer.answer}"`));
+      return initialAnswer;
+    }
+
+    const modal = await locateActiveModal(page) || page.locator('.artdeco-modal').first();
+    let currentCandidate: string | null = initialAnswer.answer;
+    let attempt = 0;
+    const maxAttempts = 3;
+
+    while (attempt < maxAttempts) {
+      attempt++;
+      
+      // 2. Deterministic normalization BEFORE filling
+      currentCandidate = deterministicNormalize(currentCandidate, field);
+
+      try {
+        await performFill(page, modal, field, currentCandidate);
+      } catch (err: any) {
+        console.warn(chalk.yellow(`    ⚠ Could not fill "${field.label}": ${err.message}`));
+      }
+
+      // 3. Trigger validation events
+      await shortPause();
+
+      // 4. Inspect validation state
+      const errorMsg = await checkValidationError(modal, field);
+      
+      if (!errorMsg) {
+        // Valid!
+        return { ...initialAnswer, answer: currentCandidate };
+      }
+
+      console.log(chalk.yellow(`    ⚠ Validation error on "${field.label}": ${errorMsg}`));
+      
+      // 5. Repair phase (if we haven't exhausted attempts)
+      if (attempt < maxAttempts) {
+        console.log(chalk.cyan(`    🔧 Attempting repair (${attempt}/${maxAttempts})...`));
+        currentCandidate = await repairCandidate(currentCandidate, errorMsg, field, context, settings);
+        if (!currentCandidate) {
+          console.log(chalk.red(`    ✖ Cannot safely repair "${field.label}". Halting.`));
+          return { tier: "halt", question: field.label, answer: currentCandidate };
+        }
+      }
+    }
+
+    console.log(chalk.red(`    ✖ Failed to repair "${field.label}" after ${maxAttempts} attempts.`));
+    return { tier: "halt", question: field.label, answer: currentCandidate };
   }
 
-  if (dryRun) {
-    console.log(
-      chalk.gray(
-        `    [DRY-RUN] Would fill "${field.label}" with "${answer.answer}"`
-      )
-    );
-    return answer;
+  function deterministicNormalize(candidate: string, field: DetectedField): string {
+    let normalized = candidate;
+    
+    if (field.type === "text") {
+      const isNumeric = field.metadata.inputType === "number" || field.metadata.inputMode === "numeric";
+      if (isNumeric) {
+        // If field wants a number and candidate has text like "30 days", extract just the number safely
+        const numMatch = candidate.match(/^\s*\+?\d*\.?\d+/);
+        if (numMatch) {
+          normalized = numMatch[0];
+        }
+      }
+      
+      const isPhone = (field.metadata.id || "").toLowerCase().includes("nationalnumber") || 
+                      /national.*number/i.test(field.label) || 
+                      /phone|mobile/i.test(field.label);
+      if (isPhone) {
+        normalized = candidate.replace(/^\s*\+\d{1,4}\s*/, "").replace(/[^0-9]/g, "");
+      }
+    }
+
+    if (field.type === "select" && field.options) {
+      // Find exact or close match among options
+      const exact = field.options.find(o => o.toLowerCase() === candidate.toLowerCase());
+      if (exact) return exact;
+      
+      // if it's "30 days" and option is "30", or vice versa
+      const numOnly = candidate.replace(/[^0-9]/g, "");
+      if (numOnly) {
+         const optWithNum = field.options.find(o => o.replace(/[^0-9]/g, "") === numOnly);
+         if (optWithNum) return optWithNum;
+      }
+    }
+
+    return normalized;
   }
 
-  const modal = page.locator('div[role="dialog"]').first();
-
-  try {
+  async function performFill(page: Page, modal: any, field: DetectedField, value: string): Promise<void> {
     switch (field.type) {
-      case "text": {
-        const input = modal.locator(field.selector).first();
-        // Check if field already has a value
-        const currentValue = await input.inputValue().catch(() => "");
-        if (currentValue.trim() === "") {
-          let textToType = answer.answer;
-          const inputType = await input.getAttribute("type").catch(() => "");
-          const inputMode = await input.getAttribute("inputmode").catch(() => "");
-          const inputId = await input.getAttribute("id").catch(() => "");
-          if (inputType === "number" || inputMode === "numeric") {
-            textToType = textToType.replace(/[^0-9.]/g, "");
-          }
-          if ((inputId || "").includes("nationalNumber") || /national.*number/i.test(field.label) || /phone|mobile/i.test(field.label)) {
-            // Strip leading country code if present (e.g. +91 8910598758 -> 8910598758)
-            textToType = textToType.replace(/^\s*\+\d{1,4}\s*/, "").replace(/[^0-9]/g, "");
-          }
-          await input.click().catch(() => {});
-          await shortPause();
-          await input.fill("");
-          await input.pressSequentially(textToType, { delay: randomKeystrokeDelay() });
-          await input.dispatchEvent("input").catch(() => {});
-          await input.dispatchEvent("change").catch(() => {});
-        }
-        break;
-      }
-
+      case "text":
       case "textarea": {
-        const textarea = modal.locator(field.selector).first();
-        const currentValue = await textarea.inputValue().catch(() => "");
-        if (currentValue.trim() === "") {
-          await textarea.click().catch(() => {});
-          await shortPause();
-          await textarea.fill("");
-          await textarea.pressSequentially(answer.answer, { delay: randomKeystrokeDelay() });
-          await textarea.dispatchEvent("input").catch(() => {});
-          await textarea.dispatchEvent("change").catch(() => {});
-        }
+        const input = modal.locator(field.selector).first();
+        await input.click().catch(() => {});
+        await input.fill("");
+        await input.pressSequentially(value, { delay: randomKeystrokeDelay() });
+        await input.dispatchEvent("input").catch(() => {});
+        await input.dispatchEvent("change").catch(() => {});
+        await input.press("Tab").catch(() => {});
         break;
       }
-
       case "select": {
-        const select = modal.locator(field.selector).first();
-        // Find the best matching option
-        const bestOption = findBestOption(answer.answer, field.options || []);
-        if (bestOption) {
-          await select.selectOption({ label: bestOption }).catch(async () => {
-            await select.selectOption({ value: bestOption }).catch(() => {});
-          });
-        }
+        const sel = modal.locator(field.selector).first();
+        await sel.selectOption({ label: value }).catch(async () => {
+          await sel.selectOption({ value }).catch(() => {});
+        });
+        await sel.dispatchEvent("change").catch(() => {});
         break;
       }
-
-      case "radio": {
-        const fieldsets = modal.locator("fieldset");
-        const fs = typeof field.fieldsetIndex === "number"
-          ? fieldsets.nth(field.fieldsetIndex)
-          : modal.locator(field.selector).first();
-
-        const bestOption = findBestOption(answer.answer, field.options || []);
-        if (bestOption && (await fs.isVisible().catch(() => false))) {
-          // 1. Try clicking label matching the option inside this specific fieldset
-          const targetLabel = fs
-            .locator("label")
-            .filter({
-              hasText: new RegExp(
-                `^\\s*${bestOption.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`,
-                "i"
-              ),
-            })
-            .first();
-
-          if (await targetLabel.isVisible().catch(() => false)) {
-            await targetLabel.click({ force: true });
-          } else {
-            // 2. Try partial text on label
-            const partialLabel = fs.locator(`label:has-text("${bestOption}")`).first();
-            if (await partialLabel.isVisible().catch(() => false)) {
-              await partialLabel.click({ force: true });
-            } else {
-              // 3. Fallback to radio input index
-              const optIndex = (field.options || []).indexOf(bestOption);
-              if (optIndex >= 0) {
-                const radioInput = fs.locator('input[type="radio"]').nth(optIndex);
-                await radioInput.check({ force: true }).catch(() => radioInput.click({ force: true }));
-              }
-            }
-          }
-        }
-        break;
-      }
-
-      case "checkbox": {
-        const cb = typeof field.checkboxIndex === "number"
-          ? modal.locator('input[type="checkbox"]').nth(field.checkboxIndex)
-          : modal.locator(field.selector).first();
-
-        if (field.required) {
-          const isChecked = await cb.isChecked().catch(() => false);
-          if (!isChecked) {
-            await cb.check({ force: true }).catch(() => cb.click({ force: true }));
-          }
-        }
-        break;
-      }
-
       case "combobox": {
-        await handleCombobox(page, modal, field, answer.answer);
+        await handleCombobox(page, modal, field, value);
         break;
       }
-
-      case "file": {
-        // File uploads are handled separately in handleResumeUpload
+      case "radio": {
+        if (field.fieldsetIndex !== undefined) {
+          const fs = modal.locator("fieldset").nth(field.fieldsetIndex);
+          const lbl = fs.locator(`label:has-text("${value}")`).first();
+          if (await lbl.isVisible().catch(() => false)) {
+            await lbl.click();
+          }
+        }
         break;
       }
-
-      default:
+      case "checkbox": {
+        if (field.checkboxIndex !== undefined && (value.toLowerCase() === "yes" || value.toLowerCase() === "true")) {
+          const cb = modal.locator('input[type="checkbox"]').nth(field.checkboxIndex);
+          const checked = await cb.isChecked().catch(() => false);
+          if (!checked) {
+            await cb.click({ force: true });
+          }
+        }
         break;
+      }
     }
-
-    await shortPause();
-  } catch (err) {
-    console.warn(
-      chalk.yellow(
-        `    ⚠ Could not fill "${field.label}": ${err instanceof Error ? err.message : String(err)}`
-      )
-    );
   }
 
-  return answer;
-}
+  async function checkValidationError(modal: any, field: DetectedField): Promise<string | null> {
+    // 1. Check aria-invalid
+    if (field.selector && field.type !== "radio" && field.type !== "checkbox") {
+      const input = modal.locator(field.selector).first();
+      const ariaInvalid = await input.getAttribute("aria-invalid").catch(() => null);
+      if (ariaInvalid === "true") {
+         return "aria-invalid=true";
+      }
+    }
 
-/**
- * Handles typeahead/combobox fields:
- * 1. Type the answer text to trigger the dropdown
- * 2. Wait for the listbox to appear
- * 3. Select the best matching option from the dropdown
- */
-async function handleCombobox(
+    // 2. Check for surrounding error elements (LinkedIn's specific error class)
+    // Often it is a sibling or inside a parent container
+    let container = modal;
+    if (field.selector) {
+       container = modal.locator(field.selector).first().locator("..");
+    }
+    const errorEl = modal.locator('.artdeco-inline-feedback--error, [data-test-form-element-error-messages]').first();
+    
+    // We check if it is visible AND near our field (or just any visible error in the modal, which usually means the active field is wrong)
+    const isErrorVisible = await errorEl.isVisible().catch(() => false);
+    if (isErrorVisible) {
+      const errText = (await errorEl.textContent().catch(() => "")) || "Invalid input";
+      return errText.trim();
+    }
+    
+    return null;
+  }
+
+  async function repairCandidate(
+    candidate: string,
+    errorMsg: string,
+    field: DetectedField,
+    context: SolverContext,
+    settings: Settings
+  ): Promise<string | null> {
+    // We can fall back to the AI for semantic repair if deterministic failed
+    const prompt = `
+You are repairing a rejected form field answer.
+Question: "${field.label}"
+Original user data context:
+${context.resumeText.substring(0, 500)} // shortened for context
+
+Attempted value: "${candidate}"
+Observed validation error: "${errorMsg}"
+Field type: ${field.type}
+Field attributes: ${JSON.stringify(field.metadata)}
+Options (if any): ${field.options ? JSON.stringify(field.options) : "None"}
+
+What should the corrected value be? Reply with ONLY the raw corrected string value, nothing else.`;
+    
+    try {
+      const { generateTextResponse } = await import("../ai.js");
+      const repaired = await generateTextResponse(settings, "form_filling", "You are an expert at repairing form values to match strict UI validation requirements. Output ONLY the raw corrected string.", prompt);
+      return repaired.trim();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function handleCombobox(
   page: Page,
   modal: ReturnType<Page["locator"]>,
   field: DetectedField,
@@ -782,7 +1063,7 @@ async function handleResumeUpload(
   page: Page,
   settings: Settings
 ): Promise<void> {
-  const modal = page.locator('div[role="dialog"]').first();
+  const modal = await locateActiveModal(page) || page.locator('.artdeco-modal').first();
 
   // Check if a resume is already uploaded (LinkedIn may pre-fill from profile)
   const existingResume = modal.locator(
@@ -911,10 +1192,8 @@ export async function stepThroughModal(
     stepNum++;
     console.log(chalk.blue(`\n  📝 Form Step ${stepNum}:`));
 
-    const modal = page.locator('div[role="dialog"]').first();
-    const isModalVisible = await modal
-      .isVisible({ timeout: 3000 })
-      .catch(() => false);
+    const modal = await locateActiveModal(page);
+    const isModalVisible = modal !== null;
 
     if (!isModalVisible) {
       return {
@@ -968,7 +1247,7 @@ export async function stepThroughModal(
     // --- Determine next action ---
 
     // Check if we're on the review page
-    const reviewBtn = modal.locator(
+    const reviewBtn = page.locator(
       'button[aria-label*="Review" i], button:has-text("Review your application"), button:has-text("Review")'
     );
     const isReviewStep = await reviewBtn
@@ -989,7 +1268,7 @@ export async function stepThroughModal(
     }
 
     // Check for Submit button (some applications skip the review page)
-    const submitBtn = modal.locator(
+    const submitBtn = page.locator(
       'button[aria-label*="Submit" i], button:has-text("Submit application")'
     );
     const isSubmitStep = await submitBtn
@@ -1009,7 +1288,7 @@ export async function stepThroughModal(
     }
 
     // Click Next to proceed
-    const nextBtn = modal.locator(
+    const nextBtn = page.locator(
       'button[aria-label*="Next" i], button[aria-label*="Continue" i], button:has-text("Next"), button:has-text("Continue"), footer button.artdeco-button--primary'
     );
     const hasNext = await nextBtn
@@ -1022,7 +1301,7 @@ export async function stepThroughModal(
       await jitterDelay(2000, 800);
 
       // Check if validation error prevented advancing
-      const errorEl = modal
+      const errorEl = page
         .locator(
           '.artdeco-inline-feedback--error, [data-test-form-element-error-messages]'
         )
@@ -1142,11 +1421,10 @@ export async function pauseForReview(
   );
 
   // Poll until the modal disappears
-  // Using page.locator('div[role="dialog"]').isVisible()
   while (true) {
     try {
-      const isModalVisible = await page.locator('div[role="dialog"]').first().isVisible().catch(() => false);
-      if (!isModalVisible) break;
+      const modalStillOpen = await locateActiveModal(page);
+      if (!modalStillOpen) break;
     } catch {
       break; // Page might have closed or navigated
     }
@@ -1206,10 +1484,8 @@ export async function handleDiscardModal(page: Page): Promise<void> {
 export async function safeCloseModal(page: Page): Promise<void> {
   if (page.isClosed()) return;
   try {
-    const modal = page.locator('div[role="dialog"]').first();
-    const isVisible = await modal
-      .isVisible({ timeout: 1000 })
-      .catch(() => false);
+    const modal = await locateActiveModal(page);
+    const isVisible = modal !== null;
 
     if (!isVisible) return;
 

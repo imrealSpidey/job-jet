@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Toaster, toast } from 'react-hot-toast';
 import { 
   Play, 
@@ -19,6 +19,35 @@ import JobJetLogo from './assets/jobjet.svg';
 const API = "http://localhost:3001";
 const inputCls = "w-full px-3 py-2 border rounded-md shadow-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-white border-gray-300 dark:border-gray-600 focus:ring-blue-500 focus:border-blue-500";
 
+/** Returns a human-readable relative time string (e.g. "2 hours ago", "3 days ago") */
+function timeAgo(dateStr: string | undefined): string {
+  if (!dateStr) return "Unknown";
+  const now = Date.now();
+  const then = new Date(dateStr).getTime();
+  if (isNaN(then)) return "Unknown";
+  const diffMs = now - then;
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days}d ago`;
+  const weeks = Math.floor(days / 7);
+  if (weeks < 5) return `${weeks}w ago`;
+  return new Date(dateStr).toLocaleDateString();
+}
+
+/** Returns freshness badge styling based on scrapedAt date */
+function getFreshnessBadge(scrapedAt: string | undefined): { label: string; cls: string } {
+  if (!scrapedAt) return { label: "No date", cls: "bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400" };
+  const diffMs = Date.now() - new Date(scrapedAt).getTime();
+  const days = diffMs / (24 * 60 * 60 * 1000);
+  if (days < 1) return { label: "Fresh", cls: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400" };
+  if (days < 7) return { label: "Recent", cls: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400" };
+  return { label: "Stale", cls: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400" };
+}
+
 interface EvaluationProgress {
   isRunning: boolean;
   total: number;
@@ -28,30 +57,33 @@ interface EvaluationProgress {
   currentJobTitle: string;
   currentCompany: string;
   currentScore: number | null;
-  status: "idle" | "evaluating" | "completed" | "error";
+  status: "idle" | "evaluating" | "completed" | "error" | "stopped";
   error: string | null;
 }
 
 const EvaluationProgressCard = ({ 
   progress, 
-  onViewApproved 
+  onViewApproved,
+  onStop
 }: { 
   progress: EvaluationProgress | null; 
   onViewApproved?: () => void;
+  onStop?: () => void;
 }) => {
   if (!progress || progress.status === 'idle') return null;
 
   const pct = progress.total > 0 ? Math.min(100, Math.round((progress.current / progress.total) * 100)) : 0;
   const isCompleted = progress.status === 'completed';
+  const isStopped = progress.status === 'stopped';
   const isRunning = progress.isRunning || progress.status === 'evaluating';
 
-  if (!isRunning && !isCompleted && !progress.error) return null;
+  if (!isRunning && !isCompleted && !isStopped && !progress.error) return null;
 
   return (
     <div className={`p-5 rounded-lg border shadow-sm transition-all duration-300 ${
       isCompleted 
         ? 'bg-green-50 dark:bg-green-950/30 border-green-200 dark:border-green-800'
-        : progress.error
+        : isStopped || progress.error
         ? 'bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-800'
         : 'bg-purple-50 dark:bg-purple-950/30 border-purple-200 dark:border-purple-800'
     }`}>
@@ -65,10 +97,20 @@ const EvaluationProgressCard = ({
           )}
           {isCompleted && <CheckCircle2 className="w-5 h-5 text-green-600 dark:text-green-400" />}
           <h4 className="font-semibold text-gray-900 dark:text-white text-sm sm:text-base">
-            {isRunning ? "AI Scoring Matrix In Progress..." : isCompleted ? "AI Scoring Completed!" : "Evaluation Issue Encountered"}
+            {isRunning ? "AI Scoring Matrix In Progress..." : isCompleted ? "AI Scoring Completed!" : isStopped ? "AI Scoring Stopped" : "Evaluation Issue Encountered"}
           </h4>
         </div>
-        <span className="text-sm font-bold font-mono text-purple-700 dark:text-purple-300">{pct}%</span>
+        <div className="flex items-center gap-3">
+          <span className="text-sm font-bold font-mono text-purple-700 dark:text-purple-300">{pct}%</span>
+          {isRunning && onStop && (
+            <button
+              onClick={onStop}
+              className="text-xs font-medium text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 hover:bg-red-100 dark:hover:bg-red-900/40 px-2 py-1 rounded transition"
+            >
+              Stop
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Progress Bar */}
@@ -419,19 +461,43 @@ const OrchestratorTab = ({ onNavigateToJobs }: { onNavigateToJobs?: () => void }
   const [evalProgress, setEvalProgress] = useState<EvaluationProgress | null>(null);
   const [autoProgress, setAutoProgress] = useState<AutomationProgress | null>(null);
   const [isAutomating, setIsAutomating] = useState(false);
+  const [rawJobs, setRawJobs] = useState<any[]>([]);
+  const [selectedBatch, setSelectedBatch] = useState<string>("all");
+  const [scrapeQuery, setScrapeQuery] = useState("");
+  const [scrapeRows, setScrapeRows] = useState(50);
+
+  const uniqueBatches = useMemo(() => {
+    const batches = new Map<string, { count: number, timestamp: string }>();
+    rawJobs.forEach(j => {
+      const bId = j.scrapeBatchId || "legacy";
+      const prev = batches.get(bId);
+      batches.set(bId, { 
+        count: (prev?.count || 0) + 1, 
+        timestamp: j.scrapedAt || prev?.timestamp || "" 
+      });
+    });
+    return Array.from(batches.entries()).sort((a, b) => b[0].localeCompare(a[0]));
+  }, [rawJobs]);
 
   const fetchData = async () => {
     try {
-      const [docsRes, profileRes, rawJobsRes, jobsRes] = await Promise.all([
+      const [docsRes, profileRes, rawJobsRes, jobsRes, settingsRes] = await Promise.all([
         fetch(`${API}/api/documents`),
         fetch(`${API}/api/profile`),
         fetch(`${API}/api/jobs/raw`),
-        fetch(`${API}/api/jobs`)
+        fetch(`${API}/api/jobs`),
+        fetch(`${API}/api/settings`)
       ]);
       if (docsRes.ok) setDocs(await docsRes.json());
       if (profileRes.ok) setProfile(await profileRes.json());
+      if (settingsRes.ok) {
+        const s = await settingsRes.json();
+        if (s.ingestion?.apify_input?.searchTerms && !scrapeQuery) setScrapeQuery(s.ingestion.apify_input.searchTerms);
+        if (s.ingestion?.apify_input?.rows && scrapeRows === 50) setScrapeRows(s.ingestion.apify_input.rows);
+      }
       if (rawJobsRes.ok) {
         const rj = await rawJobsRes.json();
+        setRawJobs(rj);
         setRawJobCount(rj.length);
       }
       if (jobsRes.ok) {
@@ -533,8 +599,19 @@ const OrchestratorTab = ({ onNavigateToJobs }: { onNavigateToJobs?: () => void }
   const handleIngest = async () => {
     setIsIngesting(true);
     try {
-      const res = await fetch(`${API}/api/pipeline/ingest`, { method: 'POST' });
+      const res = await fetch(`${API}/api/pipeline/ingest`, { 
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          query: scrapeQuery,
+          rows: scrapeRows
+        })
+      });
       if (!res.ok) throw new Error("Failed");
+      const data = await res.json();
+      if (data.batchId) {
+        setSelectedBatch(data.batchId);
+      }
       toast.success("Scraping completed");
       fetchData();
     } catch (e) {
@@ -547,7 +624,11 @@ const OrchestratorTab = ({ onNavigateToJobs }: { onNavigateToJobs?: () => void }
   const handleEvaluate = async () => {
     setIsEvaluating(true);
     try {
-      const res = await fetch(`${API}/api/pipeline/evaluate`, { method: 'POST' });
+      const res = await fetch(`${API}/api/pipeline/evaluate`, { 
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batchId: selectedBatch })
+      });
       if (!res.ok) throw new Error("Failed");
       toast.success("AI Scoring started in background");
     } catch (e) {
@@ -562,7 +643,7 @@ const OrchestratorTab = ({ onNavigateToJobs }: { onNavigateToJobs?: () => void }
       const res = await fetch(`${API}/api/pipeline/apply`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dryRun: false })
+        body: JSON.stringify({ dryRun: false, batchId: selectedBatch })
       });
       if (!res.ok) throw new Error("Failed");
       const data = await res.json();
@@ -583,6 +664,15 @@ const OrchestratorTab = ({ onNavigateToJobs }: { onNavigateToJobs?: () => void }
       toast.success("Stopping browser automation...");
     } catch (e) {
       toast.error("Failed to stop automation");
+    }
+  };
+
+  const handleStopEvaluation = async () => {
+    try {
+      await fetch(`${API}/api/pipeline/evaluate/stop`, { method: 'POST' });
+      toast.success("Stopping AI evaluation...");
+    } catch {
+      toast.error("Failed to stop evaluation");
     }
   };
 
@@ -614,7 +704,7 @@ const OrchestratorTab = ({ onNavigateToJobs }: { onNavigateToJobs?: () => void }
       </div>
 
       {/* Real-time Evaluation Progress */}
-      <EvaluationProgressCard progress={evalProgress} onViewApproved={onNavigateToJobs} />
+      <EvaluationProgressCard progress={evalProgress} onViewApproved={onNavigateToJobs} onStop={handleStopEvaluation} />
 
       {/* Real-time Browser Automation Progress */}
       <AutomationProgressCard progress={autoProgress} onStop={handleStopAutomation} />
@@ -676,37 +766,107 @@ const OrchestratorTab = ({ onNavigateToJobs }: { onNavigateToJobs?: () => void }
 
       {/* Pipeline */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <div className="bg-blue-50 dark:bg-blue-900/20 p-6 rounded-lg shadow border border-blue-100 dark:border-blue-900">
-          <div className="w-8 h-8 bg-blue-600 text-white rounded-full flex items-center justify-center font-bold mb-4">1</div>
-          <h3 className="font-semibold text-lg mb-2">Scrape Jobs</h3>
-          <p className="text-sm text-gray-600 dark:text-gray-300 mb-4 h-10">Triggers Apify to scrape LinkedIn for fresh roles matching your profile.</p>
-          <button onClick={handleIngest} disabled={isIngesting} className="w-full py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50">
-            {isIngesting ? "Scraping..." : "Run Scraper"}
-          </button>
+        <div className="bg-blue-50 dark:bg-blue-900/20 p-6 rounded-lg shadow border border-blue-100 dark:border-blue-900 flex flex-col justify-between">
+          <div>
+            <div className="w-8 h-8 bg-blue-600 text-white rounded-full flex items-center justify-center font-bold mb-4">1</div>
+            <h3 className="font-semibold text-lg mb-2">Scrape Jobs</h3>
+            <p className="text-sm text-gray-600 dark:text-gray-300 mb-4 h-10">Triggers Apify to scrape LinkedIn for fresh roles matching your profile.</p>
+          </div>
+          <div className="flex flex-col gap-2">
+            <input 
+              type="text" 
+              placeholder="e.g. Senior UI Designer" 
+              className={`${inputCls} text-sm mb-1`}
+              value={scrapeQuery}
+              onChange={(e) => setScrapeQuery(e.target.value)}
+            />
+            <div className="flex items-center justify-between text-sm mb-2 px-1">
+              <span className="text-gray-600 dark:text-gray-400">Max Jobs:</span>
+              <input 
+                type="number" 
+                className={`${inputCls} w-20 py-1`}
+                value={scrapeRows}
+                onChange={(e) => setScrapeRows(Number(e.target.value))}
+              />
+            </div>
+            <button onClick={handleIngest} disabled={isIngesting} className="w-full py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 transition">
+              {isIngesting ? "Scraping..." : "Run Scraper"}
+            </button>
+          </div>
         </div>
 
-        <div className="bg-purple-50 dark:bg-purple-900/20 p-6 rounded-lg shadow border border-purple-100 dark:border-purple-900">
-          <div className="w-8 h-8 bg-purple-600 text-white rounded-full flex items-center justify-center font-bold mb-4">2</div>
-          <h3 className="font-semibold text-lg mb-2">AI Scoring</h3>
-          <p className="text-sm text-gray-600 dark:text-gray-300 mb-4 h-10">Scores every scraped job against your resume using the AI Matrix.</p>
-          <button onClick={handleEvaluate} disabled={isEvaluating} className="w-full py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:opacity-50">
-            {isEvaluating ? `Scoring (${evalProgress?.current || 0}/${evalProgress?.total || 0})...` : "Run AI Matrix"}
-          </button>
+        <div className="bg-purple-50 dark:bg-purple-900/20 p-6 rounded-lg shadow border border-purple-100 dark:border-purple-900 flex flex-col justify-between">
+          <div>
+            <div className="w-8 h-8 bg-purple-600 text-white rounded-full flex items-center justify-center font-bold mb-4">2</div>
+            <h3 className="font-semibold text-lg mb-2">AI Scoring</h3>
+            <p className="text-sm text-gray-600 dark:text-gray-300 mb-4 h-10">Scores every scraped job against your resume using the AI Matrix.</p>
+          </div>
+          <div className="flex flex-col gap-2">
+            <select
+              value={selectedBatch}
+              onChange={(e) => setSelectedBatch(e.target.value)}
+              className={`${inputCls} text-sm mb-2`}
+            >
+              <option value="all">All Batches</option>
+              {uniqueBatches.map(([id, data]: [string, any]) => (
+                <option key={id} value={id}>
+                  {id === "legacy" ? `Initial / Legacy Import (${data.count})` : `${id.replace(/^batch_/, "")} (${data.count})`}
+                </option>
+              ))}
+            </select>
+            {isEvaluating ? (
+              <button 
+                onClick={handleStopEvaluation} 
+                className="w-full py-2.5 bg-red-600 hover:bg-red-700 text-white font-bold rounded-md shadow-md flex items-center justify-center gap-2 animate-pulse transition"
+              >
+                <X className="w-5 h-5" /> Stop AI Scoring ({evalProgress?.current || 0}/{evalProgress?.total || 0})
+              </button>
+            ) : (
+              <button onClick={handleEvaluate} className="w-full py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 transition">
+                Run AI Matrix
+              </button>
+            )}
+          </div>
         </div>
 
-        <div className="bg-green-50 dark:bg-green-900/20 p-6 rounded-lg shadow border border-green-100 dark:border-green-900">
-          <div className="w-8 h-8 bg-green-600 text-white rounded-full flex items-center justify-center font-bold mb-4">3</div>
-          <h3 className="font-semibold text-lg mb-2">Launch Browser</h3>
-          <p className="text-sm text-gray-600 dark:text-gray-300 mb-4 h-10">Opens Playwright browser for human-in-the-loop application review.</p>
-          <button 
-            onClick={handleLaunch} 
-            disabled={isAutomating || autoProgress?.isRunning}
-            className="w-full py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50 transition"
-          >
-            {isAutomating || autoProgress?.isRunning 
-              ? `Browser Active (${autoProgress?.currentIndex || 0}/${autoProgress?.total || 0})...` 
-              : "Launch Browser & Review"}
-          </button>
+        <div className="bg-green-50 dark:bg-green-900/20 p-6 rounded-lg shadow border border-green-100 dark:border-green-900 flex flex-col justify-between">
+          <div>
+            <div className="w-8 h-8 bg-green-600 text-white rounded-full flex items-center justify-center font-bold mb-4">3</div>
+            <h3 className="font-semibold text-lg mb-2">Launch Browser</h3>
+            <p className="text-sm text-gray-600 dark:text-gray-300 mb-4 h-10">Opens Playwright browser for human-in-the-loop application review.</p>
+          </div>
+          <div className="flex flex-col gap-2">
+            <select
+              value={selectedBatch}
+              onChange={(e) => setSelectedBatch(e.target.value)}
+              className={`${inputCls} text-sm mb-2`}
+            >
+              <option value="all">All Batches</option>
+              {uniqueBatches.map(([id, data]: [string, any]) => {
+                
+                return (
+                  <option key={id} value={id}>
+                    {new Date(data.timestamp || new Date().toISOString()).toLocaleString()} ({data.count})
+                  </option>
+                );
+              })}
+            </select>
+            {isAutomating || autoProgress?.isRunning ? (
+              <button 
+                onClick={handleStopAutomation}
+                className="w-full py-2.5 bg-red-600 hover:bg-red-700 text-white font-bold rounded-md shadow-md flex items-center justify-center gap-2 animate-pulse transition"
+              >
+                <X className="w-5 h-5" /> Stop Browser ({autoProgress?.currentIndex || 0}/{autoProgress?.total || 0})
+              </button>
+            ) : (
+              <button 
+                onClick={handleLaunch} 
+                className="w-full py-2 bg-green-600 text-white rounded-md hover:bg-green-700 transition"
+              >
+                Launch Browser & Review
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -719,11 +879,26 @@ const JobsTab = () => {
   const [loading, setLoading] = useState(true);
   const [viewMode, setViewMode] = useState<"approved" | "raw">("approved");
   const [searchQuery, setSearchQuery] = useState("");
-  const [sortField, setSortField] = useState<string>("");
+  const [sortField, setSortField] = useState<string>("scrapedAt");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
   const [evalProgress, setEvalProgress] = useState<EvaluationProgress | null>(null);
   const [autoProgress, setAutoProgress] = useState<AutomationProgress | null>(null);
+  const [selectedBatch, setSelectedBatch] = useState<string>("all");
+
+  const uniqueBatches = useMemo(() => {
+    const batches = new Map<string, { count: number, timestamp: string }>();
+    const pool = viewMode === "approved" ? jobs : rawJobs;
+    pool.forEach(j => {
+      const bId = j.scrapeBatchId || "legacy";
+      const prev = batches.get(bId);
+      batches.set(bId, { 
+        count: (prev?.count || 0) + 1, 
+        timestamp: j.scrapedAt || prev?.timestamp || "" 
+      });
+    });
+    return Array.from(batches.entries()).sort((a, b) => b[0].localeCompare(a[0]));
+  }, [rawJobs, jobs, viewMode]);
 
   const fetchJobs = async () => {
     try {
@@ -743,6 +918,18 @@ const JobsTab = () => {
   useEffect(() => {
     fetchJobs();
   }, []);
+
+  const handleClearStale = async () => {
+    try {
+      const res = await fetch(`${API}/api/jobs/raw/stale?olderThanDays=7`, { method: 'DELETE' });
+      if (!res.ok) throw new Error("Failed");
+      const data = await res.json();
+      toast.success(`Removed ${data.removed} stale jobs.`);
+      fetchJobs();
+    } catch (e) {
+      toast.error("Failed to clear stale jobs");
+    }
+  };
 
   // Poll automation progress in JobsTab
   useEffect(() => {
@@ -765,7 +952,7 @@ const JobsTab = () => {
       const res = await fetch(`${API}/api/pipeline/apply`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dryRun: false })
+        body: JSON.stringify({ dryRun: false, batchId: selectedBatch })
       });
       if (!res.ok) throw new Error("Failed");
       const data = await res.json();
@@ -785,6 +972,15 @@ const JobsTab = () => {
       toast.success("Stopping browser automation...");
     } catch {
       toast.error("Failed to stop automation");
+    }
+  };
+
+  const handleStopEvaluation = async () => {
+    try {
+      await fetch(`${API}/api/pipeline/evaluate/stop`, { method: 'POST' });
+      toast.success("Stopping AI evaluation...");
+    } catch {
+      toast.error("Failed to stop evaluation");
     }
   };
 
@@ -817,7 +1013,11 @@ const JobsTab = () => {
 
   const handleStartEvaluation = async () => {
     try {
-      const res = await fetch(`${API}/api/pipeline/evaluate`, { method: 'POST' });
+      const res = await fetch(`${API}/api/pipeline/evaluate`, { 
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batchId: selectedBatch })
+      });
       if (!res.ok) throw new Error("Failed");
       toast.success("AI Scoring started in background");
     } catch (e) {
@@ -826,6 +1026,10 @@ const JobsTab = () => {
   };
 
   let displayed = viewMode === "approved" ? jobs : rawJobs;
+
+  if (selectedBatch && selectedBatch !== "all") {
+    displayed = displayed.filter(j => (j.scrapeBatchId || "legacy") === selectedBatch);
+  }
 
   if (searchQuery) {
     const q = searchQuery.toLowerCase();
@@ -880,44 +1084,82 @@ const JobsTab = () => {
       <AutomationProgressCard progress={autoProgress} onStop={handleStopAuto} />
 
       {/* Live Evaluation Progress Card */}
-      <EvaluationProgressCard progress={evalProgress} />
+      <EvaluationProgressCard progress={evalProgress} onStop={handleStopEvaluation} />
 
       <div className="bg-white dark:bg-gray-800 rounded-lg shadow flex flex-col">
         <div className="p-4 border-b dark:border-gray-700 flex flex-col md:flex-row gap-4 justify-between items-center">
-          <div className="flex space-x-2 w-full md:w-auto">
+          <div className="flex space-x-2 w-full md:w-auto items-center">
             <button onClick={() => setViewMode("approved")} className={`px-4 py-2 rounded-md font-medium text-sm transition ${viewMode === "approved" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300" : "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700"}`}>
               AI Approved ({jobs.length})
             </button>
             <button onClick={() => setViewMode("raw")} className={`px-4 py-2 rounded-md font-medium text-sm transition ${viewMode === "raw" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300" : "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700"}`}>
               Raw Apify History ({rawJobs.length})
             </button>
+            {viewMode === "raw" && rawJobs.length > 0 && (
+              <button onClick={handleClearStale} className="px-3 py-1.5 ml-2 text-xs font-medium text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 hover:bg-red-100 dark:hover:bg-red-900/40 rounded transition border border-red-200 dark:border-red-800/50">
+                Clear Stale Jobs (&gt;7d)
+              </button>
+            )}
           </div>
 
-          <div className="flex items-center gap-3 w-full md:w-auto">
-            <div className="relative flex-1 md:w-64">
+          <div className="flex items-center gap-3 w-full md:w-auto flex-wrap">
+            <div className="relative flex-1 min-w-[200px]">
               <Search className="w-4 h-4 absolute left-3 top-3 text-gray-400" />
-              <input type="text" placeholder="Filter by title, company, location..." className={`${inputCls} pl-9 text-sm`} value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
+              <input type="text" placeholder="Filter by title, company..." className={`${inputCls} pl-9 text-sm`} value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
             </div>
 
-            <button
-              onClick={handleStartEvaluation}
-              disabled={evalProgress?.isRunning}
-              className="px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-md text-sm font-medium flex items-center gap-1.5 disabled:opacity-50 shrink-0 transition"
-              title="Run AI evaluation on scraped jobs"
+            <select 
+              value={selectedBatch} 
+              onChange={e => setSelectedBatch(e.target.value)}
+              className={`${inputCls} text-sm max-w-[200px]`}
             >
-              <Play className="w-4 h-4" />
-              {evalProgress?.isRunning ? `Scoring (${evalProgress.current}/${evalProgress.total})...` : "Run AI Matrix"}
-            </button>
+              <option value="all">All Batches</option>
+              {uniqueBatches.map(([id, data]: [string, any]) => (
+                <option key={id} value={id}>
+                  {id === "legacy" ? `Initial / Legacy Import (${data.count})` : `${id.replace(/^batch_/, "")} (${data.count})`}
+                </option>
+              ))}
+            </select>
 
-            <button
-              onClick={handleLaunchBrowser}
-              disabled={autoProgress?.isRunning}
-              className="px-3 py-2 bg-green-600 hover:bg-green-700 text-white rounded-md text-sm font-medium flex items-center gap-1.5 disabled:opacity-50 shrink-0 transition"
-              title="Launch browser automation for approved jobs"
-            >
-              <Play className="w-4 h-4" />
-              {autoProgress?.isRunning ? `Browser (${autoProgress.currentIndex}/${autoProgress.total})...` : "Launch Browser"}
-            </button>
+            {evalProgress?.isRunning ? (
+              <button
+                onClick={handleStopEvaluation}
+                className="px-3 py-2 bg-red-600 hover:bg-red-700 text-white rounded-md text-sm font-semibold flex items-center gap-1.5 shrink-0 animate-pulse transition shadow"
+                title="Stop AI evaluation immediately"
+              >
+                <X className="w-4 h-4" />
+                Stop Scoring ({evalProgress.current}/{evalProgress.total})
+              </button>
+            ) : (
+              <button
+                onClick={handleStartEvaluation}
+                className="px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-md text-sm font-medium flex items-center gap-1.5 shrink-0 transition"
+                title="Run AI evaluation on selected batch"
+              >
+                <Play className="w-4 h-4" />
+                Run AI Matrix
+              </button>
+            )}
+
+            {autoProgress?.isRunning ? (
+              <button
+                onClick={handleStopAuto}
+                className="px-3 py-2 bg-red-600 hover:bg-red-700 text-white rounded-md text-sm font-semibold flex items-center gap-1.5 shrink-0 animate-pulse transition shadow"
+                title="Stop browser automation"
+              >
+                <X className="w-4 h-4" />
+                Stop Browser ({autoProgress.currentIndex}/{autoProgress.total})
+              </button>
+            ) : (
+              <button
+                onClick={handleLaunchBrowser}
+                className="px-3 py-2 bg-green-600 hover:bg-green-700 text-white rounded-md text-sm font-medium flex items-center gap-1.5 shrink-0 transition"
+                title="Launch browser automation for selected batch"
+              >
+                <Play className="w-4 h-4" />
+                Launch Browser
+              </button>
+            )}
           </div>
         </div>
 
@@ -939,6 +1181,7 @@ const JobsTab = () => {
                     <th className="px-4 py-3 font-medium">Location</th>
                     <th className="px-4 py-3 font-medium cursor-pointer" onClick={() => toggleSort('score')}>Match Score <SortIcon field="score"/></th>
                     <th className="px-4 py-3 font-medium">Type</th>
+                    <th className="px-4 py-3 font-medium cursor-pointer" onClick={() => toggleSort('scrapedAt')}>Scraped <SortIcon field="scrapedAt"/></th>
                     <th className="px-4 py-3 font-medium">Actions</th>
                   </tr>
                 ) : (
@@ -951,6 +1194,7 @@ const JobsTab = () => {
                     <th className="px-4 py-3 font-medium">Experience</th>
                     <th className="px-4 py-3 font-medium">Salary</th>
                     <th className="px-4 py-3 font-medium">Posted</th>
+                    <th className="px-4 py-3 font-medium cursor-pointer" onClick={() => toggleSort('scrapedAt')}>Scraped <SortIcon field="scrapedAt"/></th>
                     <th className="px-4 py-3 font-medium cursor-pointer" onClick={() => toggleSort('score')}>Match Score <SortIcon field="score"/></th>
                     <th className="px-4 py-3 font-medium">Link</th>
                   </tr>
@@ -962,9 +1206,19 @@ const JobsTab = () => {
                   const isExpanded = expandedJob === id;
                   const scoreVal = job.matchScore ?? job.score;
                   const hasDetails = !!job.aiScoreDetails;
+                  const prevJob = idx > 0 ? displayed[idx - 1] : null;
+                  const showBatchHeader = viewMode === "raw" && (!prevJob || job.scrapeBatchId !== prevJob.scrapeBatchId);
+                  const freshness = getFreshnessBadge(job.scrapedAt);
 
                   return (
                     <React.Fragment key={id}>
+                      {showBatchHeader && (
+                        <tr className="bg-gray-100 dark:bg-gray-800">
+                          <td colSpan={11} className="px-4 py-2 text-xs font-semibold text-gray-600 dark:text-gray-300">
+                            Batch: {job.scrapeBatchId ? new Date(job.scrapedAt).toLocaleString() : "Unknown"}
+                          </td>
+                        </tr>
+                      )}
                       {viewMode === "approved" ? (
                         <tr 
                           className="hover:bg-gray-50 dark:hover:bg-gray-750 cursor-pointer transition" 
@@ -984,6 +1238,14 @@ const JobsTab = () => {
                           <td className="px-4 py-3 flex items-center gap-1.5">
                             <div className={`w-2 h-2 rounded-full ${job.easyApply ? 'bg-blue-500' : 'bg-purple-500'}`}></div>
                             {job.easyApply ? "Easy Apply" : "External"}
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="flex flex-col gap-1">
+                              <span className="text-xs text-gray-500">{timeAgo(job.scrapedAt)}</span>
+                              <span className={`inline-flex items-center w-fit px-1.5 py-0.5 rounded text-[10px] font-medium ${freshness.cls}`}>
+                                {freshness.label}
+                              </span>
+                            </div>
                           </td>
                           <td className="px-4 py-3">
                             <a href={job.url || job.jobUrl} target="_blank" rel="noreferrer" className="text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center" onClick={e => e.stopPropagation()}>
@@ -1008,6 +1270,14 @@ const JobsTab = () => {
                           <td className="px-4 py-3">{job.salary || "-"}</td>
                           <td className="px-4 py-3">{job.postedTime || job.postedAt || "Unknown"}</td>
                           <td className="px-4 py-3">
+                            <div className="flex flex-col gap-1">
+                              <span className="text-xs text-gray-500">{timeAgo(job.scrapedAt)}</span>
+                              <span className={`inline-flex items-center w-fit px-1.5 py-0.5 rounded text-[10px] font-medium ${freshness.cls}`}>
+                                {freshness.label}
+                              </span>
+                            </div>
+                          </td>
+                          <td className="px-4 py-3">
                             {scoreVal !== undefined ? (
                               <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full font-medium ${
                                 scoreVal >= 80 
@@ -1031,7 +1301,7 @@ const JobsTab = () => {
                       {/* Expandable AI Breakdown Row (works for both approved & scored raw jobs) */}
                       {isExpanded && job.aiScoreDetails && (
                         <tr className="bg-gray-50 dark:bg-gray-800/60 border-y dark:border-gray-700">
-                          <td colSpan={viewMode === "approved" ? 6 : 10} className="px-6 py-4">
+                          <td colSpan={viewMode === "approved" ? 7 : 11} className="px-6 py-4">
                             <div className="text-sm space-y-3">
                               {job.aiScoreDetails.reasoning && (
                                 <p className="italic text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-750 p-3 rounded border dark:border-gray-650">
@@ -1347,17 +1617,17 @@ const SettingsTab = () => {
   const updateTaskModel = (task: 'extraction' | 'scoring' | 'form_filling', field: 'provider' | 'model', val: string) => {
     setData((p: any) => {
       const existingModels = p.settings.ai?.models || {
-        extraction: { provider: p.settings.ai?.provider || "gemini", model: p.settings.ai?.model || "gemini-2.5-flash" },
-        scoring: { provider: p.settings.ai?.provider || "gemini", model: p.settings.ai?.model || "gemini-2.5-flash" },
-        form_filling: { provider: p.settings.ai?.provider || "gemini", model: p.settings.ai?.model || "gemini-2.5-flash" },
+        extraction: { provider: p.settings.ai?.provider || "gemini", model: p.settings.ai?.model || "gemini-1.5-flash-8b" },
+        scoring: { provider: p.settings.ai?.provider || "gemini", model: p.settings.ai?.model || "gemini-1.5-flash-8b" },
+        form_filling: { provider: p.settings.ai?.provider || "gemini", model: p.settings.ai?.model || "gemini-1.5-flash-8b" },
       };
-      const currentTask = existingModels[task] || { provider: "gemini", model: "gemini-2.5-flash" };
+      const currentTask = existingModels[task] || { provider: "gemini", model: "gemini-1.5-flash-8b" };
       let newModel = currentTask.model;
       if (field === 'provider') {
         if (val === 'openrouter') {
           newModel = task === 'extraction' ? 'google/gemini-2.0-flash-exp:free' : 'meta-llama/llama-3.3-70b-instruct:free';
         } else {
-          newModel = 'gemini-2.5-flash';
+          newModel = 'gemini-1.5-flash-8b';
         }
       } else if (field === 'model') {
         newModel = val;
@@ -1391,25 +1661,25 @@ const SettingsTab = () => {
         ai: {
           ...p.settings.ai,
           provider: "gemini",
-          model: "gemini-2.5-flash",
+          model: "gemini-1.5-flash-8b",
           models: {
             extraction: {
               provider: "gemini",
-              model: "gemini-2.5-flash"
+              model: "gemini-1.5-flash-8b"
             },
             scoring: {
               provider: hasOpenRouter ? "openrouter" : "gemini",
-              model: hasOpenRouter ? "meta-llama/llama-3.3-70b-instruct:free" : "gemini-2.5-flash"
+              model: hasOpenRouter ? "meta-llama/llama-3.3-70b-instruct:free" : "gemini-1.5-flash-8b"
             },
             form_filling: {
               provider: hasOpenRouter ? "openrouter" : "gemini",
-              model: hasOpenRouter ? "meta-llama/llama-3.3-70b-instruct:free" : "gemini-2.5-flash"
+              model: hasOpenRouter ? "meta-llama/llama-3.3-70b-instruct:free" : "gemini-1.5-flash-8b"
             }
           }
         }
       }
     }));
-    toast.success(hasOpenRouter ? "Configured optimal free hybrid preset (Gemini + OpenRouter Llama 3.3 70B)!" : "Configured optimal free Gemini preset!");
+    toast.success(hasOpenRouter ? "Configured optimal free hybrid preset (Gemini 1.5 Flash 8B + OpenRouter)!" : "Configured high-quota free Gemini preset (gemini-1.5-flash-8b)!");
   };
 
   const handleArrayToggle = (field: string, value: string, checked: boolean) => {
@@ -1439,7 +1709,7 @@ const SettingsTab = () => {
   ) => {
     const currentModelConfig = data.settings?.ai?.models?.[taskKey] || {
       provider: data.settings?.ai?.provider || "gemini",
-      model: data.settings?.ai?.model || "gemini-2.5-flash",
+      model: data.settings?.ai?.model || "gemini-1.5-flash",
     };
     const provider = currentModelConfig.provider || "gemini";
     const model = currentModelConfig.model || "";
@@ -1504,7 +1774,7 @@ const SettingsTab = () => {
               </div>
             ) : (
               <select
-                value={model || "gemini-2.5-flash"}
+                value={model || "gemini-1.5-flash"}
                 onChange={e => updateTaskModel(taskKey, 'model', e.target.value)}
                 className={inputCls}
               >
@@ -1603,14 +1873,14 @@ const SettingsTab = () => {
               { value: 'google/gemini-2.0-flash-exp:free', label: 'google/gemini-2.0-flash-exp:free (Recommended Free Multimodal)' },
               { value: 'meta-llama/llama-3.2-11b-vision-instruct:free', label: 'meta-llama/llama-3.2-11b-vision-instruct:free (Free Vision)' },
               { value: 'qwen/qwen-2.5-vl-72b-instruct:free', label: 'qwen/qwen-2.5-vl-72b-instruct:free (72B Vision Free)' },
-              { value: 'google/gemini-2.5-flash', label: 'google/gemini-2.5-flash' },
+              { value: 'google/gemini-1.5-flash', label: 'google/gemini-1.5-flash' },
               { value: 'openai/gpt-4o-mini', label: 'openai/gpt-4o-mini' },
             ],
             [
-              { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash (Recommended Free - 1M Multimodal)' },
-              { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
-              { value: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
-              { value: 'gemini-3.1-pro-preview', label: 'gemini-3.1-pro-preview (Deep Reasoning)' },
+              { value: 'gemini-1.5-flash-8b', label: 'gemini-1.5-flash-8b (Recommended High Quota Free - Fast)' },
+              { value: 'gemini-2.0-flash-exp', label: 'gemini-2.0-flash-exp (High Quota Free)' },
+              { value: 'gemini-1.5-flash', label: 'gemini-1.5-flash (Preview - 20 RPD cap on Free Tier)' },
+              { value: 'gemini-1.5-pro', label: 'gemini-1.5-pro (Deep Reasoning)' },
             ]
           )}
 
@@ -1627,9 +1897,9 @@ const SettingsTab = () => {
               { value: 'google/gemini-2.0-flash-exp:free', label: 'google/gemini-2.0-flash-exp:free' },
             ],
             [
-              { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash (Recommended Free)' },
-              { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
-              { value: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
+              { value: 'gemini-1.5-flash-8b', label: 'gemini-1.5-flash-8b (Recommended High Quota Free - Fast)' },
+              { value: 'gemini-2.0-flash-exp', label: 'gemini-2.0-flash-exp (High Quota Free)' },
+              { value: 'gemini-1.5-flash', label: 'gemini-1.5-flash (Preview - 20 RPD cap on Free Tier)' },
             ]
           )}
 
@@ -1645,9 +1915,9 @@ const SettingsTab = () => {
               { value: 'meta-llama/llama-3.1-8b-instruct:free', label: 'meta-llama/llama-3.1-8b-instruct:free (Ultra Fast)' },
             ],
             [
-              { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash (Recommended Free)' },
-              { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
-              { value: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
+              { value: 'gemini-1.5-flash-8b', label: 'gemini-1.5-flash-8b (Recommended High Quota Free - Fast)' },
+              { value: 'gemini-2.0-flash-exp', label: 'gemini-2.0-flash-exp (High Quota Free)' },
+              { value: 'gemini-1.5-flash', label: 'gemini-1.5-flash (Preview - 20 RPD cap on Free Tier)' },
             ]
           )}
         </div>

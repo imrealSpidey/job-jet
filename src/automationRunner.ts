@@ -91,7 +91,7 @@ export async function stopAutomation(): Promise<void> {
   addLog("Browser automation stopped by user", "info");
 }
 
-export async function startAutomation(dryRun = false): Promise<void> {
+export async function startAutomation(dryRun = false, batchId?: string): Promise<void> {
   if (state.isRunning) {
     throw new Error("Automation is already in progress");
   }
@@ -123,7 +123,18 @@ export async function startAutomation(dryRun = false): Promise<void> {
       addLog("Loading resume text and approved jobs...", "info");
       const resumeText = await loadResumeText(settings);
       const approvedJobs = readApprovedJobs();
-      const easyApplyJobs = approvedJobs.filter((j) => j.applyType === "EASY_APPLY");
+      let easyApplyJobs = approvedJobs.filter((j) => j.applyType === "EASY_APPLY");
+
+      if (batchId && batchId !== "all") {
+        easyApplyJobs = easyApplyJobs.filter(j => j.scrapeBatchId === batchId);
+      }
+
+      // Always process freshest jobs first
+      easyApplyJobs.sort((a, b) => {
+        const timeA = new Date(a.scrapedAt || 0).getTime();
+        const timeB = new Date(b.scrapedAt || 0).getTime();
+        return timeB - timeA;
+      });
 
       if (easyApplyJobs.length === 0) {
         state.status = "completed";
@@ -153,12 +164,25 @@ export async function startAutomation(dryRun = false): Promise<void> {
       });
 
       // Attach lifecycle listener to detect if the user closes the entire browser window
-      activeSession.context.on("close", () => {
-        if (state.isRunning) {
-          shouldStop = true;
-          state.status = "stopped";
-          state.currentStepMessage = "Automation stopped: Browser window closed.";
-          addLog("Browser window closed. Halting automation.", "warn");
+      activeSession.context.on("close", async () => {
+        if (state.isRunning && !shouldStop) {
+          // Short delay to distinguish between transient navigation events and actual browser close
+          await new Promise((r) => setTimeout(r, 1000));
+          // Double-check: if browser is truly gone, stop
+          try {
+            const browser = activeSession?.context?.browser();
+            if (!browser || !browser.isConnected()) {
+              shouldStop = true;
+              state.status = "stopped";
+              state.currentStepMessage = "Automation stopped: Browser window closed.";
+              addLog("Browser window closed. Halting automation.", "warn");
+            }
+          } catch {
+            shouldStop = true;
+            state.status = "stopped";
+            state.currentStepMessage = "Automation stopped: Browser window closed.";
+            addLog("Browser window closed. Halting automation.", "warn");
+          }
         }
       });
 
@@ -171,8 +195,24 @@ export async function startAutomation(dryRun = false): Promise<void> {
       for (let i = 0; i < easyApplyJobs.length; i++) {
         if (shouldStop) break;
 
-        // Check if browser was closed between iterations
-        if (!activeSession || (activeSession.context.browser() && !activeSession.context.browser()?.isConnected())) {
+        // Check if browser was closed between iterations (with retry to avoid false positives)
+        let browserDisconnected = false;
+        try {
+          const browser = activeSession?.context?.browser();
+          if (!activeSession || (browser && !browser.isConnected())) {
+            // Wait and retry once to handle transient disconnects during navigation
+            await new Promise((r) => setTimeout(r, 2000));
+            const retryBrowser = activeSession?.context?.browser();
+            if (!activeSession || (retryBrowser && !retryBrowser.isConnected())) {
+              browserDisconnected = true;
+            }
+          }
+        } catch {
+          // Context may have been destroyed — check if we explicitly stopped
+          if (shouldStop) browserDisconnected = true;
+        }
+
+        if (browserDisconnected) {
           shouldStop = true;
           state.status = "stopped";
           state.currentStepMessage = "Automation stopped: Browser window closed.";
@@ -233,7 +273,15 @@ export async function startAutomation(dryRun = false): Promise<void> {
             addLog(`[Skipped] ${titleStr} @ ${companyStr}: ${openResult.message}`, "warn");
 
             // Close tab immediately so skipped / closed / external jobs don't clutter the browser
-            await jobPage.close().catch(() => {});
+            // EXCEPT if it's a modal timeout, which means something went wrong and the user wants to see it.
+            if (openResult.reason === "modal_timeout") {
+              readyTabs.push(jobPage);
+              state.status = "review";
+              state.currentStepMessage = `🛑 Application halted. Modal did not open for ${titleStr}. Tab left open for your review!`;
+              addLog(`[Tab Left Open] Modal failed to open for ${titleStr} @ ${companyStr}`, "warn");
+            } else {
+              await jobPage.close().catch(() => {});
+            }
 
             // Record history
             if (!dryRun) {
@@ -308,8 +356,11 @@ export async function startAutomation(dryRun = false): Promise<void> {
             addLog(`Error on ${titleStr}: ${message}`, "error");
 
             await captureErrorScreenshot(jobPage, paths.screenshotsDir, titleStr).catch(() => {});
-            await safeCloseModal(jobPage).catch(() => {});
-            await jobPage.close().catch(() => {});
+            // Keep tab open for user review and manual submission instead of killing it!
+            readyTabs.push(jobPage);
+            state.status = "review";
+            state.currentStepMessage = `🛑 Application stopped on ${titleStr}: ${message}. Tab left open for your review!`;
+            addLog(`[Tab Left Open] Left tab open for manual review on ${titleStr} @ ${companyStr}`, "warn");
           } else if (dryRun) {
             status = "skipped";
             message = "Dry run completed";
@@ -319,11 +370,14 @@ export async function startAutomation(dryRun = false): Promise<void> {
           }
         } catch (err: any) {
           const errMsg = err?.message || String(err);
-          if (errMsg.includes("closed")) {
+          
+          // Check if the entire browser is actually dead, not just this tab
+          const browser = activeSession?.context?.browser();
+          if (!browser || !browser.isConnected()) {
             shouldStop = true;
             state.status = "stopped";
             state.currentStepMessage = "Automation stopped: Browser window closed.";
-            addLog("Browser window was closed by user. Stopping automation.", "warn");
+            addLog("Browser window was closed. Stopping automation.", "warn");
             break;
           }
 
@@ -334,8 +388,9 @@ export async function startAutomation(dryRun = false): Promise<void> {
 
           if (!jobPage.isClosed()) {
             await captureErrorScreenshot(jobPage, paths.screenshotsDir, titleStr).catch(() => {});
-            await safeCloseModal(jobPage).catch(() => {});
-            await jobPage.close().catch(() => {});
+            // Keep tab open for user review
+            readyTabs.push(jobPage);
+            addLog(`[Tab Left Open] Error on ${titleStr}. Tab kept open for review.`, "warn");
           }
         }
 
@@ -383,12 +438,8 @@ export async function startAutomation(dryRun = false): Promise<void> {
     } finally {
       if (activeSession) {
         try {
-          if (readyTabs.length > 0) {
-            // DO NOT close browser if tabs are waiting for user review!
-            await disconnectBrowser(activeSession);
-          } else {
-            await closeBrowser(activeSession);
-          }
+          // ALWAYS disconnect instead of terminating Chrome, leaving all tabs alive for user review!
+          await disconnectBrowser(activeSession);
         } catch {
           // ignore
         }

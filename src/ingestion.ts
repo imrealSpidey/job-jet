@@ -24,7 +24,9 @@ import { paths, loadHistory, getApifyToken, loadCandidateProfile } from "./confi
 // Apify API Fetch
 // ============================================================
 
-async function fetchFromApify(settings: Settings): Promise<void> {
+export async function fetchFromApify(
+  settings: Settings
+): Promise<{ items: any[]; scrapeBatchId: string; newItemsCount: number }> {
   const token = getApifyToken();
   const client = new ApifyClient({ token });
   const actorId = settings.ingestion.apify_actor_id;
@@ -39,33 +41,67 @@ async function fetchFromApify(settings: Settings): Promise<void> {
   try {
     const input: Record<string, any> = { ...settings.ingestion.apify_input };
     
-    // Default to at least 40 jobs if not configured or too small
-    if (!input.rows || input.rows <= 10) {
-      input.rows = 40;
-    }
-    // Default easyApply to true if not explicitly false
-    if (input.easyApply === undefined) {
-      input.easyApply = true;
-    }
-
-    // Inject dynamic search terms from the AI Candidate Profile
     const profile = loadCandidateProfile();
-    if (profile.search?.titles?.length > 0) {
-      input.titles = profile.search.titles;
+    console.log(chalk.gray(`\n  [SEARCH] User query: ${input.searchTerms || "None"}`));
+
+    let finalTitles: string[] = [];
+    if (input.searchTerms) {
+      finalTitles.push(input.searchTerms);
     }
-    if (profile.search?.locations?.length > 0) {
-      input.locations = profile.search.locations;
+    if (profile.search?.titles && profile.search.titles.length > 0) {
+      finalTitles.push(...profile.search.titles);
+    }
+    finalTitles = Array.from(new Set(finalTitles));
+
+    let finalLocations: string[] = [];
+    if (input.locations && Array.isArray(input.locations)) {
+      finalLocations.push(...input.locations);
+    } else if (input.location) {
+      finalLocations.push(input.location);
+    }
+    
+    if (profile.search?.locations && profile.search.locations.length > 0) {
+      finalLocations.push(...profile.search.locations);
+    } else if (profile.personal_info?.city) {
+      finalLocations.push(profile.personal_info.city);
+    }
+    finalLocations = Array.from(new Set(finalLocations));
+
+    console.log(chalk.gray(`  [SEARCH] Final titles: ${JSON.stringify(finalTitles)}`));
+    console.log(chalk.gray(`  [SEARCH] Final locations: ${JSON.stringify(finalLocations)}`));
+
+    if (finalTitles.length === 0) {
+      throw new Error("Missing job title/keyword. Neither user search nor profile extraction provided a title. Aborting search.");
+    }
+    
+    if (finalLocations.length === 0) {
+      throw new Error("Missing location constraint. Aborting to prevent global search.");
     }
 
-    console.log(chalk.gray(`  Searching titles: ${JSON.stringify(input.titles || [])}`));
-    console.log(chalk.gray(`  Searching locations: ${JSON.stringify(input.locations || [])}`));
-    console.log(chalk.gray(`  Max rows requested: ${input.rows}, Easy Apply: ${input.easyApply}`));
+    const maxItems = input.rows || input.maxItems || 50;
+    const easyApply = input.easyApply !== undefined ? input.easyApply : true;
 
-    const run = await client.actor(actorId).call(input);
+    const finalPayload: Record<string, any> = {
+      ...input,
+      titles: finalTitles,
+      locations: finalLocations,
+      maxItems: maxItems,
+      easyApply: easyApply
+    };
+    
+    delete finalPayload.searchTerms;
+    delete finalPayload.rows;
+    delete finalPayload.location;
+
+    console.log(chalk.gray(`  [APIFY] Final search payload: ${JSON.stringify({ ...finalPayload, token: undefined })}`));
+
+    const run = await client.actor(actorId).call(finalPayload);
     
     console.log(chalk.gray(`  Actor run finished (ID: ${run.id}). Fetching dataset...`));
 
     const { items } = await client.dataset(run.defaultDatasetId).listItems();
+    const scrapeBatchId = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const scrapedAt = new Date().toISOString();
     
     // Merge new items with existing raw jobs by URL/ID so previous scrapes are not lost
     let existingJobs: any[] = [];
@@ -77,19 +113,23 @@ async function fetchFromApify(settings: Settings): Promise<void> {
 
     const seenUrls = new Set(existingJobs.map((j: any) => j.url || j.jobUrl || j.applyUrl || j.id));
     let newItemsCount = 0;
+    const currentRunJobs: any[] = [];
     for (const item of items) {
       const url = (item as any).url || (item as any).jobUrl || (item as any).applyUrl || (item as any).id;
+      const jobWithMeta = { ...item, scrapedAt, scrapeBatchId };
+      currentRunJobs.push(jobWithMeta);
       if (url && !seenUrls.has(url)) {
-        existingJobs.push(item);
+        existingJobs.push(jobWithMeta);
         seenUrls.add(url);
         newItemsCount++;
       }
     }
 
     // If existing jobs was empty, just write items
-    const toSave = existingJobs.length > 0 ? existingJobs : items;
+    const toSave = existingJobs.length > 0 ? existingJobs : currentRunJobs;
     fs.writeFileSync(paths.jobsRaw, JSON.stringify(toSave, null, 2), "utf-8");
     console.log(chalk.green(`  ✔ Ingested ${items.length} jobs (${newItemsCount} new, total ${toSave.length} in jobs_raw.json)`));
+    return { items: currentRunJobs, scrapeBatchId, newItemsCount };
   } catch (err) {
     console.error(
       chalk.red.bold(`✖ [APIFY ERROR]`),
@@ -320,7 +360,23 @@ export function filterByRoleRelevance(jobs: RawJob[], targetTitles: string[]): R
     "frontend developer", "front end developer", "backend developer", "back end developer",
     "full stack developer", "fullstack developer", "full stack engineer", "software engineer",
     "software developer", "react developer", "web developer", "java developer", "python developer",
-    "devops engineer", "qa engineer", "test engineer", "mobile developer", "ios developer", "android developer"
+    "devops", "cloud engineer", "qa engineer", "test engineer", "mobile developer", "ios developer", "android developer",
+    "programmer", "data engineer", "data scientist", "solutions architect"
+  ];
+
+  const unrelatedDisciplines = [
+    "technician", "mechanic", "electrician", "plumber", "carpenter", "construction",
+    "estimator", "welder", "maintenance", "hvac", "installer", "machinist", "operator",
+    "warehouse", "forklift", "laborer", "custodian",
+    "driver", "delivery", "courier", "dispatch", "trucking", "shipping",
+    "housekeeper", "housekeeping", "cleaner", "janitor", "maid", "server",
+    "bartender", "barista", "waiter", "waitress", "cook", "chef", "dishwasher",
+    "hotel", "front desk", "slot service", "casino", "valet",
+    "mortgage", "loan officer", "teller", "tax", "accountant", "accounting", "bookkeeper",
+    "auditor", "payroll", "actuary", "underwriter", "insurance", "realtor", "real estate",
+    "cashier", "sales representative", "sales rep", "store associate", "retail associate",
+    "nurse", "nursing", "medical assistant", "caregiver", "dental", "pharmacy",
+    "security guard", "security officer", "attorney", "paralegal"
   ];
 
   const designRoleKeywords = [
@@ -334,16 +390,19 @@ export function filterByRoleRelevance(jobs: RawJob[], targetTitles: string[]): R
   for (const job of jobs) {
     const titleLower = job.title.toLowerCase();
 
-    // Candidate is in Design track, but scraped job is purely Engineering/Development
+    // Candidate is in Design track, but scraped job is purely Engineering/Development or unrelated profession
     if (isDesignCandidate && !isDeveloperCandidate) {
-      const isDevRole = devRoleKeywords.some((kw) => titleLower.includes(kw));
       const hasDesignInTitle = titleLower.includes("designer") || titleLower.includes("design") ||
                                titleLower.includes("ux") || titleLower.includes("ui") ||
                                titleLower.includes("creative");
 
-      if (isDevRole && !hasDesignInTitle) {
+      const isDevRole = devRoleKeywords.some((kw) => titleLower.includes(kw));
+      const isUnrelated = unrelatedDisciplines.some((kw) => titleLower.includes(kw));
+
+      if (!hasDesignInTitle && (isDevRole || isUnrelated)) {
+        const reason = isDevRole ? "developer/engineering role" : "unrelated profession";
         console.log(
-          chalk.red(`  ✗ Role Filtered (Mismatch): "${job.title}" at ${job.company} is a developer/engineering role (seeking Design)`)
+          chalk.red(`  ✗ Role Filtered (Mismatch): "${job.title}" at ${job.company} is a ${reason} (seeking Design)`)
         );
         filteredCount++;
         continue;
@@ -383,17 +442,33 @@ export function filterByRoleRelevance(jobs: RawJob[], targetTitles: string[]): R
 
 /**
  * Runs the full ingestion pipeline: parse → blacklist → role relevance → deduplicate.
+ * In 'api' mode, it processes ONLY the jobs discovered in the current scrape run.
+ * In 'json' mode, it filters jobs_raw.json (optionally filtered by batchId).
  * Returns the filtered array of jobs ready for AI scoring.
  */
 export async function runIngestionPipeline(
   blacklist: Blacklist,
-  settings: Settings
+  settings: Settings,
+  options?: { batchId?: string }
 ): Promise<RawJob[]> {
+  let raw: RawJob[] = [];
+
   if (settings.ingestion.mode === "api") {
-    await fetchFromApify(settings);
+    const apifyResult = await fetchFromApify(settings);
+    console.log(
+      chalk.blue.bold(`\n📥 [CURRENT SCRAPE]`),
+      `Received ${apifyResult.items.length} jobs from Apify (Batch: ${apifyResult.scrapeBatchId})`
+    );
+    raw = apifyResult.items.map((item) => normalizeRawJobInput(item));
+  } else {
+    const all = ingestRawJobs();
+    if (options?.batchId && options.batchId !== "all") {
+      raw = all.filter((j: any) => j.scrapeBatchId === options.batchId);
+    } else {
+      raw = all;
+    }
   }
 
-  const raw = ingestRawJobs();
   const blacklisted = applyBlacklist(raw, blacklist);
 
   // Apply intelligent role relevance filter against candidate profile target titles

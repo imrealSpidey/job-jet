@@ -124,7 +124,7 @@ echo   Press Ctrl+C to stop the app at any time.
 echo.
 
 REM Automatically open the Web Dashboard in the user's default browser after 3 seconds
-start "" powershell -NoProfile -Command "Start-Sleep -Seconds 3; Start-Process 'http://localhost:5173'"
+start "" powershell -NoProfile -Command "$timeout=30; $elapsed=0; while($elapsed -lt $timeout) { try { $null = Invoke-WebRequest -Uri 'http://localhost:3001/api/settings' -UseBasicParsing -TimeoutSec 1 -ErrorAction Stop; $null = Invoke-WebRequest -Uri 'http://localhost:5173' -UseBasicParsing -TimeoutSec 1 -ErrorAction Stop; Start-Process 'http://localhost:5173'; exit } catch { Start-Sleep -Seconds 1; $elapsed++ } }; Write-Host 'Timeout: servers did not start within 30s'"
 
 REM Start both backend API server and frontend Vite server concurrently
 call npx concurrently --names "API,UI" --prefix-colors "blue,green" --kill-others-on-fail "npx tsx src/server.ts" "cd ui && npm run dev"
