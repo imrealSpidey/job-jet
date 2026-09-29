@@ -19,38 +19,63 @@ import { generateStructuredResponse, getModelForTask, abortAiOperations, type Ai
 // System Prompt for Batched Job Scoring
 // ============================================================
 
-const BATCH_SCORING_SYSTEM_PROMPT = `You are a strict hiring match evaluator. Your task is to evaluate a batch of job postings against a candidate's profile.
+const BATCH_SCORING_SYSTEM_PROMPT = `You are an expert talent evaluation engine. Your task is to evaluate a batch of job postings against a candidate's profile with high precision and nuanced judgment.
 
-RULES:
-1. Be strict and honest — only score above 80 if there is GENUINE, DEMONSTRABLE alignment between the candidate's skills/experience and the job requirements.
-2. NEVER fabricate, invent, or assume skills that are not explicitly stated in the candidate profile or resume highlights.
-3. For each job, evaluate across these dimensions (0-100):
-   - Core Technical Stack (0-100): Direct overlap of required technical skills & design tools
-   - Seniority Alignment (0-100): Experience level and seniority match
-   - Domain Relevance (0-100): Industry and domain experience fit
-   - Bonus Skills (0-100): Nice-to-have skills present
-4. Penalize heavily if the job requires skills or experience the candidate clearly lacks.
-5. Determine applyType strictly:
-   - 'EXTERNAL': job description directs applicants to apply on a company website, external career portal (Workday, Greenhouse, Lever, Taleo, iCIMS, or custom link), or email.
-   - 'EASY_APPLY': job posting specifies applying on LinkedIn directly or has no external apply link mentioned.
-   - 'UNKNOWN': uncertain.
-6. CRITICAL ROLE & PROFESSION INTEGRITY:
-   - You MUST verify that the primary job profession matches the candidate's profession.
-   - If the candidate is a Designer (UI/UX, Product Designer, Interaction Designer) but the job is an Engineering/Development role (Frontend Developer, Full Stack Engineer, Software Developer, React Engineer), totalScore MUST be capped under 40% and marked REJECT. Collaborating with developers does NOT make a designer qualified as a developer.
-   - If the candidate is a Software Developer, do NOT approve Designer, Sales, or HR roles.
-   - If the core job discipline does not match the candidate's primary discipline, totalScore MUST be below 45%.
+EVALUATION PRINCIPLES:
+1. INDEPENDENT EVALUATION:
+   - Evaluate every job posting strictly and independently against the candidate profile.
+   - Do NOT compare, rank, or benchmark jobs in the batch against each other.
+   - A job evaluated in Batch 1 must receive the identical score if evaluated in Batch 2.
+
+2. NUANCED FIT VS. KEYWORD MATCHING:
+   - Evaluate true capability, responsibilities, and transferable skills.
+   - Do NOT penalize a candidate simply because job title phrasing differs (e.g., "Product Designer", "UX Designer", "UI/UX Designer", and "UX/Interaction Designer" share core design competencies).
+   - Do NOT penalize candidates for exceeding minimum experience requirements unless the job explicitly bars senior practitioners. A candidate with 5 years experience applying for a 1-3 year or 3+ year role demonstrates strong seniority alignment (score 80-95, not penalized as "overqualified").
+
+3. DISTINGUISH HARD MISMATCHES FROM SOFT GAPS:
+   - HARD MISMATCH (Dimension score 0-35):
+     * Completely different profession or core discipline (e.g., Software Engineer, Full Stack Developer, Mechanical Engineer, Sales, HR vs. UI/UX Designer).
+     * Missing mandatory non-negotiable certification or license.
+     * Incompatible seniority (e.g., Executive / VP / Director requiring 12+ years vs. 5 years).
+     * If the core discipline does not match, Core Technical Stack MUST be scored <= 30.
+   - SOFT GAP (Dimension score 65-85):
+     * Missing one secondary or preferred tool (e.g., Figma expert missing Adobe XD or Principle).
+     * Adjacent industry domain (e.g., SaaS B2B designer applying to FinTech, EdTech, or Energy analytics).
+     * Preferred or nice-to-have qualification missing.
+     * Soft gaps should cause moderate, proportionate deductions, NEVER destroying an otherwise strong match.
+
+4. SCORING DIMENSIONS (0-100 each):
+   - coreTechnicalStack (0-100): Overlap of primary technical skills, design methodologies, tools (e.g., Figma, design systems, wireframing, prototyping, user research, usability testing, WCAG accessibility, AI workflows).
+     * 90-100: Exceptional direct match on primary tools and core competencies.
+     * 75-89: Strong match on core competencies with minor secondary tool gaps.
+     * 40-74: Partial overlap or mixed discipline.
+     * 0-39: Wrong profession (e.g., coding/engineering roles for a designer).
+   - seniorityAlignment (0-100): Alignment of years of experience and level of autonomy/scope.
+     * 85-100: Matches or appropriately exceeds requirements (e.g., 5 yrs for mid-senior or 1-4 yr roles).
+     * 70-84: Slight stretch or candidate has slightly more/less experience than target.
+     * 0-40: Major gap (e.g., Executive/VP requiring 12+ years).
+   - domainRelevance (0-100): Industry, product type, and business context.
+     * 80-100: Relevant digital product, SaaS, enterprise, tech, or mobile platform experience.
+     * 60-79: Adjacent domain with highly transferable product UX problems.
+     * 20-59: Specialized non-digital domain (e.g., interior design, physical architecture, civil engineering, automotive body sheet metal).
+   - bonusSkills (0-100): Nice-to-haves, AI-assisted workflows, leadership, agile collaboration.
+
+5. APPLY TYPE:
+   - 'EXTERNAL': Job directs applicants to apply on an external website, company career portal (Workday, Greenhouse, Lever, etc.), or via email.
+   - 'EASY_APPLY': Posting indicates LinkedIn Easy Apply or has no external application portal mentioned.
+   - 'UNKNOWN': Ambiguous or unspecified.
 
 OUTPUT FORMAT:
 You MUST evaluate EVERY job in the input list and return a JSON object with a "results" array.
 Each element in "results" must contain:
 - jobId: string (must match the input jobId exactly)
-- totalScore: integer 0-100 (weighted average based on provided weights)
-- subScores: object with coreTechnicalStack (integer), seniorityAlignment (integer), domainRelevance (integer), bonusSkills (integer)
+- totalScore: integer 0-100 (estimated weighted score based on provided weights)
+- subScores: object with coreTechnicalStack (0-100), seniorityAlignment (0-100), domainRelevance (0-100), bonusSkills (0-100)
 - applyType: 'EASY_APPLY' | 'EXTERNAL' | 'UNKNOWN'
 - pros: array of strings (matching points)
 - cons: array of strings (weaknesses or mismatches)
 - missingSkills: array of strings (required skills the candidate lacks)
-- reasoning: a 2-3 sentence explanation of why this score was given`;
+- reasoning: a 2-3 sentence explanation of why these scores were given`;
 
 // ============================================================
 // Response Validation Schema
@@ -183,20 +208,29 @@ function getCandidateProfileSummary(resumeText: string): string {
     parts.push(`Location: ${profile.personal_info.city}`);
   }
   if (profile.professional?.years_of_experience) {
-    parts.push(`Experience: ${profile.professional.years_of_experience} years`);
+    parts.push(`Total Experience: ${profile.professional.years_of_experience} years`);
   }
   if (profile.education?.degree) {
     parts.push(`Education: ${profile.education.degree}${profile.education.university ? ` (${profile.education.university})` : ""}`);
   }
 
-  // Add clean concise excerpt of resume text (up to 2500 chars) for core skills and highlights
-  if (resumeText) {
-    const cleanText = resumeText
+  // Prioritize CURRENT RESUME text over LinkedIn export if both exist in resumeText
+  let formattedResume = resumeText;
+  if (resumeText && resumeText.includes("--- CURRENT RESUME ---")) {
+    const resumeIndex = resumeText.indexOf("--- CURRENT RESUME ---");
+    const resumePart = resumeText.substring(resumeIndex);
+    const linkedinPart = resumeText.substring(0, resumeIndex);
+    formattedResume = `${resumePart}\n\n${linkedinPart}`;
+  }
+
+  // Add clean concise excerpt of resume text (up to 5000 chars) for core skills and highlights
+  if (formattedResume) {
+    const cleanText = formattedResume
       .replace(/[\r\n]+/g, "\n")
       .replace(/\s+/g, " ")
       .trim();
-    const excerpt = cleanText.length > 2500 ? cleanText.substring(0, 2500) + "..." : cleanText;
-    parts.push(`\nResume Highlights:\n${excerpt}`);
+    const excerpt = cleanText.length > 5000 ? cleanText.substring(0, 5000) + "..." : cleanText;
+    parts.push(`\nCandidate Background & Experience Highlights:\n${excerpt}`);
   }
 
   return parts.join("\n");
@@ -278,13 +312,13 @@ function updateRawJobsFile(updatedJobs: RawJob[]) {
 // Adaptive Batch Creation
 // ============================================================
 
-function createJobBatches(jobs: RawJob[], maxBatchSize: number = 10, maxCharsPerBatch: number = 20000): RawJob[][] {
+function createJobBatches(jobs: RawJob[], maxBatchSize: number = 10, maxCharsPerBatch: number = 32000): RawJob[][] {
   const batches: RawJob[][] = [];
   let currentBatch: RawJob[] = [];
   let currentBatchChars = 0;
 
   for (const job of jobs) {
-    const descLen = (job.description || "").length;
+    const descLen = Math.min((job.description || "").length, 4500);
     if (
       currentBatch.length > 0 &&
       (currentBatch.length >= maxBatchSize || currentBatchChars + descLen > maxCharsPerBatch)
@@ -320,7 +354,8 @@ async function scoreBatchWithRetry(
     title: j.title,
     company: (j as any).companyName || j.company || "Unknown",
     location: j.location || "Unknown",
-    description: (j.description || "").substring(0, 2000),
+    applyType: j.applyType || ((j as any).easyApply ? "EASY_APPLY" : undefined),
+    description: (j.description || "").substring(0, 4500),
   }));
 
   const userPrompt = `=== CANDIDATE PROFILE ===
@@ -335,7 +370,7 @@ Evaluation Weights:
 === JOBS TO EVALUATE (${batch.length} jobs) ===
 ${JSON.stringify(jobsPayload, null, 2)}
 
-Evaluate all ${batch.length} jobs. Return a JSON object with format:
+Evaluate all ${batch.length} jobs independently. Return a JSON object with format:
 { "results": [ { "jobId": "...", "totalScore": 85, "subScores": { "coreTechnicalStack": 90, "seniorityAlignment": 80, "domainRelevance": 85, "bonusSkills": 80 }, "applyType": "EASY_APPLY", "pros": [...], "cons": [...], "missingSkills": [...], "reasoning": "..." } ] }`;
 
   const maxRetries = 2;
@@ -356,10 +391,27 @@ Evaluate all ${batch.length} jobs. Return a JSON object with format:
       console.log(chalk.gray(`  [SCORING] Batch schema valid: true`));
 
       const resultsMap = new Map<string, GeminiScore>();
+      const weights = settings.evaluation_weights;
+      const totalWeight =
+        (weights.core_technical_stack +
+          weights.seniority_alignment +
+          weights.domain_relevance +
+          weights.bonus_skills) || 100;
+
       for (const res of validated) {
+        const sub = res.subScores;
+        // Deterministic weighted score calculation using configured weights
+        const computedScore = Math.round(
+          (sub.coreTechnicalStack * weights.core_technical_stack +
+            sub.seniorityAlignment * weights.seniority_alignment +
+            sub.domainRelevance * weights.domain_relevance +
+            sub.bonusSkills * weights.bonus_skills) /
+            totalWeight
+        );
+
         resultsMap.set(res.jobId, {
-          totalScore: res.totalScore,
-          subScores: res.subScores as any,
+          totalScore: computedScore,
+          subScores: sub as any,
           applyType: res.applyType,
           pros: res.pros,
           cons: res.cons,
@@ -392,7 +444,8 @@ Evaluate all ${batch.length} jobs. Return a JSON object with format:
 export async function evaluateJobs(
   jobs: RawJob[],
   resumeText: string,
-  settings: Settings
+  settings: Settings,
+  forceRescore: boolean = false
 ): Promise<ScoredJob[]> {
   const { config: aiConfig, apiKeys, fallbackConfig, fallbackApiKeys } = getModelForTask(settings, "scoring");
 
@@ -416,7 +469,7 @@ export async function evaluateJobs(
 
   for (const job of dedupedJobs) {
     const key = job.url || job.id;
-    const existing = key ? knownScores.get(key) : null;
+    const existing = !forceRescore && key ? knownScores.get(key) : null;
     if (existing && existing.matchScore !== undefined && existing.aiScoreDetails) {
       (job as any).matchScore = existing.matchScore;
       (job as any).aiScoreDetails = existing.aiScoreDetails;
@@ -460,7 +513,7 @@ export async function evaluateJobs(
   }
 
   // Partition new jobs into batches
-  const batches = createJobBatches(toScore, 10, 20000);
+  const batches = createJobBatches(toScore, 10, 32000);
   const candidateSummary = getCandidateProfileSummary(resumeText);
 
   console.log(chalk.gray(`[SCORING] Batch size: ${batches[0]?.length || 0}`));
@@ -540,7 +593,17 @@ export async function evaluateJobs(
           }
           (job as any).applyType = finalApplyType;
 
-          if (totalScore >= settings.evaluation_weights.match_threshold) {
+          const isApproved = totalScore >= settings.evaluation_weights.match_threshold;
+          const decision = isApproved ? "APPROVE" : "REJECT";
+          const sub = scoreResult.subScores;
+
+          console.log(`[SCORING] Job: ${job.title} @ ${(job as any).companyName || job.company || "Unknown"}`);
+          console.log(`[SCORING] Dimension scores: Tech=${sub.coreTechnicalStack}, Seniority=${sub.seniorityAlignment}, Domain=${sub.domainRelevance}, Bonus=${sub.bonusSkills}`);
+          console.log(`[SCORING] Final score: ${totalScore}%`);
+          console.log(`[SCORING] Decision: ${decision}`);
+          console.log(`[SCORING] Threshold: ${settings.evaluation_weights.match_threshold}%`);
+
+          if (isApproved) {
             console.log(chalk.green(`    ✔ ${job.title} @ ${job.company}: APPROVED (${totalScore}%) [${finalApplyType}]`));
             currentProgress.approvedCount++;
             approvedJobs.push({

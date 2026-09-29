@@ -211,15 +211,6 @@ export async function loadSourceOfTruth(): Promise<string> {
   
   let combined = "";
 
-  const linkedinPath = findSourceFile("linkedin_export");
-  const linkedinText = await extractDocumentText(linkedinPath);
-  if (linkedinText) {
-    combined += `\n--- LINKEDIN EXPORT ---\n${linkedinText}\n`;
-    console.log(chalk.green(`  ✔ Loaded ${path.basename(linkedinPath)}`));
-  } else {
-    console.log(chalk.yellow(`  ⚠ Missing or unreadable linkedin_export (looked for: ${path.basename(linkedinPath)})`));
-  }
-
   const resumePath = findSourceFile("current_resume");
   const resumeText = await extractDocumentText(resumePath);
   if (resumeText) {
@@ -235,6 +226,15 @@ export async function loadSourceOfTruth(): Promise<string> {
     } else {
       console.log(chalk.yellow(`  ⚠ Missing or unreadable resume (looked for: ${path.basename(resumePath)})`));
     }
+  }
+
+  const linkedinPath = findSourceFile("linkedin_export");
+  const linkedinText = await extractDocumentText(linkedinPath);
+  if (linkedinText) {
+    combined += `\n--- LINKEDIN EXPORT ---\n${linkedinText}\n`;
+    console.log(chalk.green(`  ✔ Loaded ${path.basename(linkedinPath)}`));
+  } else {
+    console.log(chalk.yellow(`  ⚠ Missing or unreadable linkedin_export (looked for: ${path.basename(linkedinPath)})`));
   }
 
   if (combined.trim().length === 0) {
